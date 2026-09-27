@@ -1,155 +1,350 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
+import {
+  CachedCardCatalog,
+  scryfallCatalog,
+} from './domain/catalog'
+import {
+  addCardToCollection,
+  decksAffectedByCard,
+  mergeCards,
+  newlyEnabledCommanders,
+  resolveCollectionCardId,
+} from './domain/scryfall'
+import { deleteSavedDeck, getSavedDeckId, parseDeckList, upsertSavedDeck, type SavedDeck } from './domain/workspace'
 import {
   buildDeck,
   describeRole,
   exportDeckList,
   findOwnedCommanders,
-  getCard,
   getRoleCounts,
   getRoleLabel,
   importCollectionCsv,
+  mergeCollection,
   sampleCards,
   sampleCollection,
   validateDeck,
+  type Card,
   type Collection,
   type Deck,
 } from './domain/deck'
 import './App.css'
+import './catalog.css'
+import './workspace.css'
+import './decks.css'
 
 const STORAGE_KEY = 'spellbook-collection-v1'
+const cardCatalog = new CachedCardCatalog(scryfallCatalog)
 
-function loadSavedState(): { collection: Collection; deck: Deck | null; selectedCommander: string } {
+type View = 'collection' | 'builder' | 'catalog'
+
+interface SavedState {
+  collection: Collection
+  deck: Deck | null
+  selectedCommander: string
+  cards: Card[]
+  savedDecks: SavedDeck[]
+  activeSavedDeckId: string
+}
+
+function loadSavedState(): SavedState {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY)
-    if (saved) {
-      const parsed = JSON.parse(saved) as { collection?: Collection; deck?: Deck | null; selectedCommander?: string }
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw) {
+      const saved = JSON.parse(raw) as Partial<SavedState>
       return {
-        collection: parsed.collection ?? sampleCollection,
-        deck: parsed.deck ?? null,
-        selectedCommander: parsed.selectedCommander ?? 'alela',
+        collection: saved.collection ?? sampleCollection,
+        deck: saved.deck ?? null,
+        selectedCommander: saved.selectedCommander ?? 'alela',
+        cards: mergeCards(sampleCards, saved.cards ?? []),
+        savedDecks: saved.savedDecks ?? [],
+        activeSavedDeckId: saved.activeSavedDeckId ?? '',
       }
     }
   } catch {
-    // A malformed local save should not prevent the sample app from starting.
+    // Keep the app usable if browser storage is unavailable or malformed.
   }
-  return { collection: sampleCollection, deck: null, selectedCommander: 'alela' }
+  return { collection: sampleCollection, deck: null, selectedCommander: 'alela', cards: sampleCards, savedDecks: [], activeSavedDeckId: '' }
 }
 
 function App() {
   const [initial] = useState(loadSavedState)
-  const [collection, setCollection] = useState<Collection>(initial.collection)
-  const [selectedCommander, setSelectedCommander] = useState(initial.selectedCommander)
+  const [collection, setCollection] = useState(initial.collection)
+  const [cards, setCards] = useState(initial.cards)
   const [deck, setDeck] = useState<Deck | null>(initial.deck)
-  const [query, setQuery] = useState('')
-  const [notice, setNotice] = useState('')
-  const [importErrors, setImportErrors] = useState<string[]>([])
+  const [savedDecks, setSavedDecks] = useState<SavedDeck[]>(initial.savedDecks)
+  const [activeSavedDeckId, setActiveSavedDeckId] = useState(initial.activeSavedDeckId)
+  const [deckName, setDeckName] = useState('')
+  const [deckNameError, setDeckNameError] = useState('')
+  const [showDeckImport, setShowDeckImport] = useState(false)
+  const [deckImportText, setDeckImportText] = useState('')
+  const [deckImportErrors, setDeckImportErrors] = useState<string[]>([])
+  const [selectedCommander, setSelectedCommander] = useState(initial.selectedCommander)
+  const [view, setView] = useState<View>('builder')
+  const [collectionQuery, setCollectionQuery] = useState('')
+  const [catalogQuery, setCatalogQuery] = useState('')
+  const [catalogResults, setCatalogResults] = useState<Card[]>([])
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogError, setCatalogError] = useState('')
+  const [pendingCardId, setPendingCardId] = useState('')
+  const [addQuantity, setAddQuantity] = useState(1)
+  const [newCommanders, setNewCommanders] = useState<string[]>([])
   const [showImport, setShowImport] = useState(false)
-  const [view, setView] = useState<'collection' | 'builder'>('builder')
+  const [importErrors, setImportErrors] = useState<string[]>([])
+  const [notice, setNotice] = useState('')
+  const searchSequence = useRef(0)
+  const fileInput = useRef<HTMLInputElement>(null)
 
-  const commanders = findOwnedCommanders(sampleCards, collection)
-  const selectedCommanderCard = getCard(selectedCommander)
-  const buildableCardCount = sampleCards.filter((card) => card.id !== selectedCommander
-    && (collection[card.id] ?? 0) > 0
-    && card.commanderLegal
-    && card.colorIdentity.every((color) => selectedCommanderCard?.colorIdentity.includes(color))).length
-  const inventory = useMemo(() => sampleCards
-    .filter((card) => (collection[card.id] ?? 0) > 0 && card.name.toLowerCase().includes(query.toLowerCase()))
-    .sort((a, b) => a.name.localeCompare(b.name)), [collection, query])
-  const deckIssues = deck ? validateDeck(deck, sampleCards, collection) : []
-  const selectedCards = deck?.cards.map((entry) => ({ ...entry, card: getCard(entry.cardId)! })) ?? []
-  const roleCounts = deck ? getRoleCounts(deck, sampleCards) : {}
+  const cardById = (id: string) => cards.find((card) => card.id === id)
+  const commanders = findOwnedCommanders(cards, collection)
+  const commander = cardById(selectedCommander)
+  const inventory = useMemo(() => cards
+    .filter((card) => (collection[card.id] ?? 0) > 0 && card.name.toLowerCase().includes(collectionQuery.toLowerCase()))
+    .sort((a, b) => a.name.localeCompare(b.name)), [cards, collection, collectionQuery])
+  const deckIssues = deck ? validateDeck(deck, cards, collection) : []
+  const deckCardRows = deck?.cards.map((entry) => ({ ...entry, card: cardById(entry.cardId) })).filter((entry) => entry.card) ?? []
+  const roleCounts = deck ? getRoleCounts(deck, cards) : {}
+  const affectedDecks = deck && commander ? [{
+    name: commander.name,
+    cardIds: deck.cards.map((entry) => entry.cardId),
+    colorIdentity: commander.colorIdentity,
+  }] : []
 
-  function saveCollection(next: Collection, message: string) {
+  function persist(nextCollection: Collection, nextDeck = deck, nextCommander = selectedCommander, nextCards = cards, nextSavedDecks = savedDecks, nextActiveDeckId = activeSavedDeckId) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        collection: nextCollection,
+        deck: nextDeck,
+        selectedCommander: nextCommander,
+        cards: nextCards,
+        savedDecks: nextSavedDecks,
+        activeSavedDeckId: nextActiveDeckId,
+      }))
+    } catch {
+      setNotice('Browser storage is full or unavailable. Export a collection backup to keep your changes.')
+    }
+  }
+
+  function updateCollection(next: Collection, message: string) {
     setCollection(next)
-    const selectedDeck = deck && next[deck.commanderId] ? deck : null
-    if (deck && !selectedDeck) setDeck(null)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ collection: next, deck: selectedDeck, selectedCommander: next[selectedCommander] ? selectedCommander : '' }))
+    let nextDeck = deck && (next[deck.commanderId] ?? 0) > 0 ? deck : null
+    let nextSavedDecks = savedDecks
+    if (!nextDeck && deck) {
+      nextSavedDecks = savedDecks.map((saved) => saved.id === activeSavedDeckId
+        ? { ...saved, deck, updatedAt: new Date().toISOString() }
+        : saved)
+      setSavedDecks(nextSavedDecks)
+      setActiveSavedDeckId('')
+    }
+    setDeck(nextDeck)
+    persist(next, nextDeck, selectedCommander, cards, nextSavedDecks, nextDeck ? activeSavedDeckId : '')
     setNotice(message)
+  }
+
+  function decrement(cardId: string) {
+    const quantity = (collection[cardId] ?? 0) - 1
+    const next = { ...collection }
+    if (quantity < 1) delete next[cardId]
+    else next[cardId] = quantity
+    updateCollection(next, 'Collection updated.')
+  }
+
+  function increment(cardId: string) {
+    updateCollection(addCardToCollection(collection, cardId), 'Collection updated.')
   }
 
   function generateDeck() {
     try {
-      const nextDeck = buildDeck(sampleCards, collection, selectedCommander)
+      const nextDeck = buildDeck(cards, collection, selectedCommander)
       setDeck(nextDeck)
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ collection, deck: nextDeck, selectedCommander }))
-      setNotice('A new draft is ready. This draft only uses cards in your collection.')
+      setActiveSavedDeckId('')
+      setDeckName('')
+      persist(collection, nextDeck, selectedCommander, cards, savedDecks, '')
+      setNotice('Draft created from cards in your collection.')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not build this deck.')
     }
   }
 
-  function updateDeck(nextDeck: Deck) {
-    setDeck(nextDeck)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ collection, deck: nextDeck, selectedCommander }))
-  }
-
-  function removeCard(cardId: string) {
-    if (!deck || cardId === deck.commanderId) return
-    const target = deck.cards.find((entry) => entry.cardId === cardId)
-    if (!target) return
-    const card = getCard(cardId)
-    const quantity = target.quantity - 1
-    const cards = quantity > 0
-      ? deck.cards.map((entry) => entry.cardId === cardId ? { ...entry, quantity } : entry)
-      : deck.cards.filter((entry) => entry.cardId !== cardId)
-    const next = { ...deck, cards }
-    next.missing = Math.max(0, 100 - next.cards.reduce((total, entry) => total + entry.quantity, 0))
-    next.complete = next.missing === 0
-    updateDeck(next)
-    if (card && /Basic Land/i.test(card.typeLine) && quantity > 0) setNotice(`Removed one ${card.name} from the draft.`)
-  }
-
-  function addCard(cardId: string) {
+  function saveCurrentDeck() {
     if (!deck) return
-    const card = getCard(cardId)
-    if (!card || (collection[cardId] ?? 0) < 1) return
-    const target = deck.cards.find((entry) => entry.cardId === cardId)
-    const isBasicLand = /Basic Land/i.test(card.typeLine)
-    if (target && !isBasicLand) return
-    const currentTotal = deck.cards.reduce((total, entry) => total + entry.quantity, 0)
-    if (currentTotal >= 100) return
-    const cards = target
+    try {
+      const id = activeSavedDeckId || getSavedDeckId(deckName) || `deck-${Date.now()}`
+      const updated = upsertSavedDeck(savedDecks, { id, name: deckName, deck, updatedAt: new Date().toISOString() })
+      setSavedDecks(updated)
+      setActiveSavedDeckId(id)
+      persist(collection, deck, deck.commanderId, cards, updated, id)
+      setDeckNameError('')
+      setNotice('Deck saved to your local deck library.')
+    } catch (error) {
+      setDeckNameError(error instanceof Error ? error.message : 'Could not save this deck.')
+    }
+  }
+
+  function openSavedDeck(saved: SavedDeck) {
+    setDeck(saved.deck)
+    setSelectedCommander(saved.deck.commanderId)
+    setActiveSavedDeckId(saved.id)
+    setDeckName(saved.name)
+    persist(collection, saved.deck, saved.deck.commanderId, cards, savedDecks, saved.id)
+    setView('builder')
+    setNotice(`Opened ${saved.name}.`)
+  }
+
+  function removeSavedDeck(deckId: string) {
+    const updated = deleteSavedDeck(savedDecks, deckId)
+    const nextActiveId = activeSavedDeckId === deckId ? '' : activeSavedDeckId
+    setSavedDecks(updated)
+    setActiveSavedDeckId(nextActiveId)
+    persist(collection, deck, selectedCommander, cards, updated, nextActiveId)
+    setNotice('Saved deck removed from this browser.')
+  }
+
+  function importDeckList() {
+    const parsed = parseDeckList(deckImportText, cards)
+    setDeckImportErrors(parsed.errors)
+    if (!parsed.entries.length) return
+    const commanderId = parsed.commanderId ?? parsed.entries[0].cardId
+    const entries = parsed.entries.filter((entry) => entry.cardId !== commanderId)
+    const deckCards = [{ cardId: commanderId, quantity: 1 }, ...entries]
+    const total = deckCards.reduce((sum, entry) => sum + entry.quantity, 0)
+    const importedDeck: Deck = { commanderId, cards: deckCards, complete: total === 100, missing: Math.max(0, 100 - total) }
+    const name = `${cardById(commanderId)?.name ?? 'Imported'} deck`
+    const id = getSavedDeckId(name) || `deck-${Date.now()}`
+    const updated = upsertSavedDeck(savedDecks, { id, name, deck: importedDeck, updatedAt: new Date().toISOString() })
+    setSavedDecks(updated)
+    setDeck(importedDeck)
+    setSelectedCommander(commanderId)
+    setDeckName(name)
+    setActiveSavedDeckId(id)
+    persist(collection, importedDeck, commanderId, cards, updated, id)
+    setShowDeckImport(false)
+    setDeckImportText('')
+    setView('builder')
+    setNotice(`Imported ${name} into your deck library.`)
+  }
+
+  function saveEditedDeck(nextDeck: Deck) {
+    const total = nextDeck.cards.reduce((sum, entry) => sum + entry.quantity, 0)
+    nextDeck.missing = Math.max(0, 100 - total)
+    nextDeck.complete = total === 100
+    setDeck(nextDeck)
+    let nextSavedDecks = savedDecks
+    if (activeSavedDeckId) {
+      const active = savedDecks.find((saved) => saved.id === activeSavedDeckId)
+      if (active) {
+        nextSavedDecks = upsertSavedDeck(savedDecks, { ...active, deck: nextDeck, updatedAt: new Date().toISOString() })
+        setSavedDecks(nextSavedDecks)
+      }
+    }
+    persist(collection, nextDeck, selectedCommander, cards, nextSavedDecks, activeSavedDeckId)
+  }
+
+  function removeDeckCard(cardId: string) {
+    if (!deck || cardId === deck.commanderId) return
+    const current = deck.cards.find((entry) => entry.cardId === cardId)
+    if (!current) return
+    const nextCards = current.quantity > 1
+      ? deck.cards.map((entry) => entry.cardId === cardId ? { ...entry, quantity: entry.quantity - 1 } : entry)
+      : deck.cards.filter((entry) => entry.cardId !== cardId)
+    saveEditedDeck({ ...deck, cards: nextCards })
+  }
+
+  function addOwnedCardToDeck(cardId: string) {
+    if (!deck || (collection[cardId] ?? 0) < 1) return
+    const card = cardById(cardId)
+    if (!card) return
+    const current = deck.cards.find((entry) => entry.cardId === cardId)
+    const basicLand = /Basic Land/i.test(card.typeLine)
+    if (current && !basicLand) return
+    const total = deck.cards.reduce((sum, entry) => sum + entry.quantity, 0)
+    if (total >= 100) return
+    const nextCards = current
       ? deck.cards.map((entry) => entry.cardId === cardId ? { ...entry, quantity: Math.min(entry.quantity + 1, collection[cardId]) } : entry)
       : [...deck.cards, { cardId, quantity: 1 }]
-    const next = { ...deck, cards }
-    next.missing = Math.max(0, 100 - next.cards.reduce((total, entry) => total + entry.quantity, 0))
-    next.complete = next.missing === 0
-    updateDeck(next)
+    saveEditedDeck({ ...deck, cards: nextCards })
+  }
+
+  async function searchCards(query: string) {
+    setCatalogQuery(query)
+    setCatalogError('')
+    const requestId = ++searchSequence.current
+    if (query.trim().length < 2) {
+      setCatalogResults([])
+      setCatalogLoading(false)
+      return
+    }
+    setCatalogLoading(true)
+    try {
+      const results = await cardCatalog.search(query)
+      if (requestId !== searchSequence.current) return
+      setCards((current) => {
+        const merged = mergeCards(current, results)
+        persist(collection, deck, selectedCommander, merged)
+        return merged
+      })
+      setCatalogResults(results)
+    } catch (error) {
+      if (requestId === searchSequence.current) {
+        setCatalogError(error instanceof Error ? error.message : 'Card search failed. Please try again.')
+        setCatalogResults([])
+      }
+    } finally {
+      if (requestId === searchSequence.current) setCatalogLoading(false)
+    }
+  }
+
+  function confirmAcquisition(cardId: string) {
+    const card = cardById(cardId)
+    if (!card) return
+    const inventoryId = resolveCollectionCardId(card, cards, collection)
+    const updatedCollection = addCardToCollection(collection, inventoryId, addQuantity)
+    const unlocked = newlyEnabledCommanders(collection, updatedCollection, cards).map((entry) => entry.name)
+    setNewCommanders(unlocked)
+    setCollection(updatedCollection)
+    persist(updatedCollection)
+    setPendingCardId('')
+    setAddQuantity(1)
+    const deckNames = decksAffectedByCard(card, affectedDecks)
+    setNotice(deckNames.length
+      ? `Added ${card.name}. It may fit ${deckNames.join(', ')}.`
+      : `Added ${addQuantity} × ${card.name} to your collection.`)
   }
 
   function handleImport(file?: File) {
     if (!file) return
     const reader = new FileReader()
     reader.onload = () => {
-      const result = importCollectionCsv(String(reader.result ?? ''), sampleCards)
-      setImportErrors(result.errors)
-      if (Object.keys(result.collection).length > 0) {
-        setCollection(result.collection)
-        setDeck(null)
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ collection: result.collection, deck: null, selectedCommander: '' }))
-        setNotice(`Imported ${Object.values(result.collection).reduce((sum, value) => sum + value, 0)} cards from ${file.name}.`)
-      } else if (result.errors.length === 0) {
-        setNotice('No collection cards were imported.')
+      const parsed = importCollectionCsv(String(reader.result ?? ''), cards)
+      setImportErrors(parsed.errors)
+      if (Object.keys(parsed.collection).length === 0) {
+        if (!parsed.errors.length) setNotice('No recognized cards were imported.')
+        return
       }
-      if (result.errors.length === 0) setShowImport(false)
+      const updated = mergeCollection(collection, parsed.collection)
+      const unlocked = newlyEnabledCommanders(collection, updated, cards).map((entry) => entry.name)
+      setNewCommanders(unlocked)
+      setCollection(updated)
+      setDeck(null)
+      let nextSavedDecks = savedDecks
+      if (deck && activeSavedDeckId) {
+        nextSavedDecks = savedDecks.map((saved) => saved.id === activeSavedDeckId
+          ? { ...saved, deck, updatedAt: new Date().toISOString() }
+          : saved)
+        setSavedDecks(nextSavedDecks)
+      }
+      setActiveSavedDeckId('')
+      persist(updated, null, '', cards, nextSavedDecks, '')
+      setNotice(`Added ${Object.values(parsed.collection).reduce((sum, count) => sum + count, 0)} cards from ${file.name}.`)
+      if (!parsed.errors.length) setShowImport(false)
     }
     reader.readAsText(file)
+    if (fileInput.current) fileInput.current.value = ''
   }
 
-  function chooseCommander(commanderId: string) {
-    setSelectedCommander(commanderId)
+  function chooseCommander(cardId: string) {
+    setSelectedCommander(cardId)
     setDeck(null)
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ collection, deck: null, selectedCommander: commanderId }))
-  }
-
-  function exportCollection() {
-    const lines = ['name,quantity', ...Object.entries(collection).map(([id, quantity]) => `${getCard(id)?.name ?? id},${quantity}`)]
-    downloadFile('spellbook-collection.csv', lines.join('\n'), 'text/csv')
-  }
-
-  function exportDeck() {
-    if (!deck) return
-    downloadFile('commander-deck.txt', exportDeckList(deck, sampleCards), 'text/plain')
+    persist(collection, null, cardId)
   }
 
   function downloadFile(name: string, content: string, type: string) {
@@ -161,17 +356,32 @@ function App() {
     URL.revokeObjectURL(url)
   }
 
-  function decrement(cardId: string) {
-    const quantity = (collection[cardId] ?? 0) - 1
-    const next = { ...collection }
-    if (quantity < 1) delete next[cardId]
-    else next[cardId] = quantity
-    saveCollection(next, 'Collection updated.')
+  function exportCollection() {
+    const rows = ['name,quantity', ...Object.entries(collection).map(([id, quantity]) => {
+      const name = cardById(id)?.name ?? id
+      return `"${name.replaceAll('"', '""')}",${quantity}`
+    })]
+    downloadFile('spellbook-collection.csv', rows.join('\n'), 'text/csv')
   }
 
-  function increment(cardId: string) {
-    saveCollection({ ...collection, [cardId]: (collection[cardId] ?? 0) + 1 }, 'Collection updated.')
+  function exportDeck() {
+    if (deck) downloadFile('commander-deck.txt', exportDeckList(deck, cards), 'text/plain')
   }
+
+  function resetSampleCollection() {
+    setCollection(sampleCollection)
+    setDeck(null)
+    setSelectedCommander('alela')
+    persist(sampleCollection, null, 'alela')
+    setShowImport(false)
+    setNotice('Sample collection restored.')
+  }
+
+  const totalOwned = Object.values(collection).reduce((sum, count) => sum + count, 0)
+  const buildableCount = cards.filter((card) => card.id !== selectedCommander
+    && (collection[card.id] ?? 0) > 0
+    && card.commanderLegal
+    && card.colorIdentity.every((color) => commander?.colorIdentity.includes(color))).length
 
   return (
     <main className="app-shell">
@@ -179,7 +389,8 @@ function App() {
         <a className="brand" href="#top" aria-label="Spellbook home"><span className="brand-mark">✦</span><span>spellbook</span></a>
         <nav className="main-nav" aria-label="Main navigation">
           <button className={view === 'collection' ? 'nav-link active' : 'nav-link'} onClick={() => setView('collection')}>My collection</button>
-          <button className={view === 'builder' ? 'nav-link active' : 'nav-link'} onClick={() => setView('builder')}>Deck builder</button>
+          <button className={view === 'builder' ? 'nav-link active' : 'nav-link'} onClick={() => setView('builder')}>Decks</button>
+          <button className={view === 'catalog' ? 'nav-link active' : 'nav-link'} onClick={() => setView('catalog')}>Cards</button>
         </nav>
         <div className="profile-chip"><span className="status-dot" /> Local collection <span className="avatar">R</span></div>
       </header>
@@ -187,11 +398,11 @@ function App() {
       <section className="hero" id="top">
         <div className="hero-copy">
           <div className="eyebrow"><span>✧</span> YOUR CARDS. YOUR NEXT DECK.</div>
-          <h1>Find the deck<br />hiding in your <em>collection.</em></h1>
-          <p>Pick a commander you love. We’ll find a starting point using cards you already own.</p>
+          <h1>Your whole<br />Magic <em>toolkit.</em></h1>
+          <p>Keep your cards and decks together. Add a card, then see what it could unlock.</p>
           <div className="hero-actions">
-            <button className="button button-primary" onClick={() => setView('builder')}>Explore my collection <span>↗</span></button>
-            <button className="button button-quiet" onClick={() => setShowImport(true)}>＋ Import collection</button>
+            <button className="button button-primary" onClick={() => setView('builder')}>Explore my decks <span>↗</span></button>
+            <button className="button button-quiet" onClick={() => setView('catalog')}>＋ Add cards</button>
           </div>
           <div className="trust-note"><span>◈</span> Your collection stays on this device</div>
         </div>
@@ -203,27 +414,52 @@ function App() {
             <div className="card-art"><div className="moon" /><div className="tower tower-one" /><div className="tower tower-two" /><div className="faerie">✧</div><div className="spark spark-a">✦</div><div className="spark spark-b">✦</div></div>
             <div className="feature-card-bottom"><strong>Alela, Artful Provocateur</strong><span>W U B</span></div>
           </div>
-          <div className="floating-label label-top"><span>✧</span> Your collection, reimagined</div>
-          <div className="floating-label label-bottom"><span className="pulse" /> {buildableCardCount} owned cards in this sample can build around</div>
+          <div className="floating-label label-top"><span>✧</span> Your collection, connected</div>
+          <div className="floating-label label-bottom"><span className="pulse" /> {buildableCount} compatible owned cards in sample data</div>
           <div className="mini-star star-one">✧</div><div className="mini-star star-two">✦</div>
         </div>
       </section>
 
       <section className="stat-row" aria-label="Collection overview">
-        <div className="stat"><span className="stat-icon violet">▤</span><div><strong>{Object.values(collection).reduce((sum, count) => sum + count, 0).toLocaleString()}</strong><span>Cards in collection</span></div></div>
-        <div className="stat"><span className="stat-icon green">♧</span><div><strong>{commanders.length}</strong><span>Commanders to explore</span></div></div>
+        <div className="stat"><span className="stat-icon violet">▤</span><div><strong>{totalOwned.toLocaleString()}</strong><span>Cards in collection</span></div></div>
+        <div className="stat"><span className="stat-icon green">♧</span><div><strong>{commanders.length}</strong><span>Owned commanders</span></div></div>
         <div className="stat"><span className="stat-icon gold">✧</span><div><strong>{Object.keys(collection).length}</strong><span>Unique cards</span></div></div>
-        <div className="stat stat-note"><span>✦</span><span>Built around what<br />you already own.</span></div>
+        <div className="stat stat-note"><span>✦</span><span>One living collection<br />for all your decks.</span></div>
       </section>
 
       <section className="workspace" id="workspace">
         <div className="section-heading">
-          <div><div className="eyebrow"><span>01</span> THE FUN PART</div><h2>{view === 'builder' ? 'Choose your commander' : 'Your collection'}</h2><p>{view === 'builder' ? 'Start with a legendary creature you already own.' : 'The cards you have, all in one place.'}</p></div>
-          <button className="text-button" onClick={() => setShowImport(true)}>＋ Import cards <span>→</span></button>
+          <div><div className="eyebrow"><span>01</span> YOUR MTG TOOLKIT</div><h2>{view === 'builder' ? 'Choose your commander' : view === 'collection' ? 'Your collection' : 'Card catalog'}</h2><p>{view === 'builder' ? 'Build an editable first draft using cards you own.' : view === 'collection' ? 'Your cards, quantities, and collection tools.' : 'Search the card catalog, add inventory, and see potential deck impact.'}</p></div>
+          <button className="text-button" onClick={() => view === 'catalog' ? setShowImport(true) : setView('catalog')}>{view === 'catalog' ? '＋ Import CSV' : '＋ Add cards'} <span>→</span></button>
         </div>
 
-        {view === 'builder' ? (
+        {view === 'catalog' ? (
+          <div className="catalog-view">
+            <div className="catalog-intro"><div><div className="eyebrow"><span>ADD TO YOUR LIVING COLLECTION</span></div><h2>Search cards. See what changes.</h2><p>Find a card, add it to inventory, and see possible deck fits or newly available commanders. Recommendations never modify decks automatically.</p></div><button className="button button-outline" onClick={() => { setImportErrors([]); setShowImport(true) }}>Import collection CSV</button></div>
+            <label className="catalog-search search-box"><span>⌕</span><input value={catalogQuery} onChange={(event) => void searchCards(event.target.value)} placeholder="Search any Magic card — e.g. Sol Ring…" aria-label="Search the card catalog" /></label>
+            {catalogLoading && <div className="catalog-message">Searching Scryfall card data…</div>}
+            {catalogError && <div className="catalog-message error">{catalogError} You can still manage your collection.</div>}
+            {catalogQuery.trim().length < 2 && <div className="catalog-message">Type at least two characters to search.</div>}
+            <div className="catalog-results">{catalogResults.slice(0, 20).map((card) => {
+              const owned = collection[card.id] ?? 0
+              const impact = decksAffectedByCard(card, affectedDecks)
+              return <article className="catalog-card" key={card.id}>
+                {card.imageUrl ? <img src={card.imageUrl} alt={`${card.name} card`} loading="lazy" /> : <div className="catalog-card-placeholder">✧</div>}
+                <div className="catalog-card-content"><strong>{card.name}</strong><span>{card.typeLine} · {card.manaValue} mana value · {card.colorIdentity.join('') || 'Colorless'}</span><span>{card.commanderLegal ? 'Commander legal' : 'Not Commander legal'}{card.setCode ? ` · ${card.setCode.toUpperCase()} #${card.collectorNumber ?? ''}` : ''}</span>{owned > 0 && <span className="catalog-owned">In collection ×{owned}</span>}{impact.length > 0 && <span className="catalog-impact">Could fit: {impact.join(', ')}</span>}</div>
+                {pendingCardId === card.id ? <div className="acquisition-controls"><input aria-label="Quantity to add" type="number" min="1" max="999" value={addQuantity} onChange={(event) => setAddQuantity(Math.max(1, Number(event.target.value) || 1))} /><button className="button button-primary" onClick={() => confirmAcquisition(card.id)}>Add</button><button className="button button-quiet" onClick={() => setPendingCardId('')}>Cancel</button></div> : <button className="button button-outline catalog-add" onClick={() => { setPendingCardId(card.id); setAddQuantity(1) }}>{owned > 0 ? 'Add copies +' : 'Add to collection +'}</button>}
+              </article>
+            })}</div>
+            {catalogResults.length > 20 && <p className="catalog-message">Showing 20 matches; refine your search.</p>}
+            {newCommanders.length > 0 && <div className="catalog-message success"><strong>New commander options unlocked:</strong> {newCommanders.join(', ')}</div>}
+            <div className="scanner-panel"><div><div className="eyebrow"><span>SCANNER ROADMAP</span></div><strong>Scan cards with your camera</strong><p>Next milestone: scan → confirm identification → add. Misreads won’t silently alter your collection.</p></div><button className="button button-outline" onClick={() => setNotice('Camera scanning is planned next. Search the catalog or import a CSV for now.')}>▣ Scanner info</button></div>
+            <p className="catalog-attribution">Card data and images provided by Scryfall. Unofficial fan application; not affiliated with Wizards of the Coast or Scryfall.</p>
+          </div>
+        ) : view === 'builder' ? (
           <>
+            <section className="saved-decks-panel" aria-label="Saved deck library">
+              <div className="saved-decks-heading"><div><strong>My decks</strong><span>{savedDecks.length} saved locally</span></div><div className="saved-deck-actions"><button className="button button-outline" onClick={() => { setDeckImportErrors([]); setDeckImportText(''); setShowDeckImport(true) }}>Import deck list</button><button className="button button-outline" onClick={() => { setDeck(null); setDeckName(''); setActiveSavedDeckId('') }}>New deck</button></div></div>
+              {savedDecks.length ? <div className="saved-decks-list">{savedDecks.map((saved) => <article className={`saved-deck-card ${saved.id === activeSavedDeckId ? 'active' : ''}`} key={saved.id}><button className="saved-deck-open" onClick={() => openSavedDeck(saved)}><strong>{saved.name}</strong><span>{cardById(saved.deck.commanderId)?.name ?? 'Commander'} · {saved.deck.cards.reduce((sum, entry) => sum + entry.quantity, 0)}/100 cards</span></button><button className="saved-deck-delete" aria-label={`Delete ${saved.name}`} onClick={() => removeSavedDeck(saved.id)}>×</button></article>)}</div> : <p className="saved-decks-empty">No saved decks yet. Build one below and save it to your local library.</p>}
+            </section>
             <div className="commander-grid">
               {commanders.map((card, index) => (
                 <button key={card.id} className={`commander-card ${selectedCommander === card.id ? 'selected' : ''}`} onClick={() => chooseCommander(card.id)}>
@@ -231,7 +467,7 @@ function App() {
                   <div className="commander-info"><div className="commander-title"><strong>{card.name}</strong>{selectedCommander === card.id && <span className="check">✓</span>}</div><span>{card.typeLine}</span><div className="commander-meta"><span>{card.colorIdentity.join(' · ') || 'Colorless'}</span><span>Owned ×{collection[card.id]}</span></div></div>
                 </button>
               ))}
-              {commanders.length === 0 && <div className="empty-state">No eligible commanders in this collection yet. Import a collection or add a card in My collection.</div>}
+              {commanders.length === 0 && <div className="empty-state">No eligible commanders in this collection yet. Add cards from the catalog or import a CSV.</div>}
             </div>
 
             <div className="build-panel">
@@ -239,26 +475,27 @@ function App() {
             </div>
 
             {deck && <section className="deck-results" aria-live="polite">
-              <div className="results-header"><div><div className="eyebrow"><span>02</span> YOUR FIRST DRAFT</div><h2>{getCard(deck.commanderId)?.name}</h2><p>{deck.complete ? '100 cards — complete draft' : `${100 - deck.missing} cards selected · ${deck.missing} more needed`}</p></div><div className="results-actions"><button className="button button-outline" onClick={exportDeck}>Export list ↓</button><button className="button button-primary" onClick={generateDeck}>Regenerate ✦</button></div></div>
-                <div className="validation-banner"><span className={deckIssues.length ? 'validation-icon warning' : 'validation-icon'}>{deckIssues.length ? '!' : '✓'}</span><div><strong>{deckIssues.length ? 'Needs attention' : deck.complete ? 'Rules check passed' : 'Owned-card draft · incomplete'}</strong><span>{deckIssues.length ? deckIssues.map((issue) => issue.message).join(' ') : deck.complete ? 'All selected cards pass the current prototype checks.' : 'This draft uses only eligible cards in your sample catalog. Add more owned cards to fill the remaining slots.'}</span></div></div>
-                <div className="role-strip">{Object.entries(roleCounts).map(([role, count]) => <div className="role-stat" key={role}><span>{role}</span><strong>{count}</strong></div>)}</div>
-                <div className="deck-columns"><div className="deck-list-panel"><div className="panel-title"><strong>Deck cards</strong><span>{deck.cards.length} entries</span></div>{selectedCards.map(({ card, quantity }) => <div className="deck-row" key={card.id}><span className={`role-dot role-${getRoleLabel(card)}`} /><div className="deck-row-name"><strong>{card.name}</strong><span>{getRoleLabel(card)} · {describeRole(getRoleLabel(card))}</span></div><span className="deck-quantity">×{quantity}</span>{card.id !== deck.commanderId && <button aria-label={`Remove ${card.name}`} className="remove-card" onClick={() => removeCard(card.id)}>×</button>}</div>)}</div>
-                  <aside className="deck-aside"><div className="panel-title"><strong>From your collection</strong><span>{inventory.length} available</span></div><label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search cards…" /></label><div className="available-list">{inventory.filter((card) => {
-                    const entry = deck.cards.find((item) => item.cardId === card.id)
-                    return card.id !== deck.commanderId && (!entry || (/Basic Land/i.test(card.typeLine) && entry.quantity < (collection[card.id] ?? 0)))
-                  }).map((card) => <div className="available-card" key={card.id}><span className={`role-dot role-${getRoleLabel(card)}`} /><span>{card.name}</span><span className="available-qty">×{collection[card.id]}</span><button aria-label={`Add ${card.name}`} onClick={() => addCard(card.id)}>＋</button></div>)}</div><div className="tip-box"><span>✧</span><p><strong>Why these cards?</strong><br />Cards are selected from what you own, within your commander’s colors, and grouped by their role in a deck.</p></div></aside></div>
-              </section>}
-            <div className="below-note"><span>✧</span> This is a starting point, not a final list. Make it yours.</div>
+              <div className="results-header"><div><div className="eyebrow"><span>02</span> YOUR DECK</div><h2>{cardById(deck.commanderId)?.name}</h2><p>{deck.complete ? '100 cards — complete draft' : `${100 - deck.missing} cards selected · ${deck.missing} more needed`}</p></div><div className="results-actions"><button className="button button-outline" onClick={exportDeck}>Export list ↓</button><button className="button button-primary" onClick={generateDeck}>Regenerate ✦</button></div></div>
+              <div className="save-deck-bar"><label>Deck name<input value={deckName} onChange={(event) => { setDeckName(event.target.value); setDeckNameError('') }} placeholder={`${cardById(deck.commanderId)?.name ?? 'Commander'} deck`} /></label><button className="button button-primary" onClick={saveCurrentDeck}>{activeSavedDeckId ? 'Update saved deck' : 'Save deck'}</button>{deckNameError && <span className="save-error">{deckNameError}</span>}</div>
+              <div className="validation-banner"><span className={deckIssues.length ? 'validation-icon warning' : 'validation-icon'}>{deckIssues.length ? '!' : '✓'}</span><div><strong>{deckIssues.length ? 'Needs attention' : deck.complete ? 'Prototype checks passed' : 'Owned-card draft · incomplete'}</strong><span>{deckIssues.length ? deckIssues.map((issue) => issue.message).join(' ') : deck.complete ? 'Selected cards pass this prototype’s checks. Verify official rules before play.' : 'This draft uses eligible cards in your collection. Add more cards to fill the remaining slots.'}</span></div></div>
+              <div className="role-strip">{Object.entries(roleCounts).map(([role, count]) => <div className="role-stat" key={role}><span>{role}</span><strong>{count}</strong></div>)}</div>
+              <div className="deck-columns"><div className="deck-list-panel"><div className="panel-title"><strong>Deck cards</strong><span>{deck.cards.length} entries</span></div>{deckCardRows.map(({ card, quantity }) => card && <div className="deck-row" key={card.id}><span className={`role-dot role-${getRoleLabel(card)}`} /><div className="deck-row-name"><strong>{card.name}</strong><span>{getRoleLabel(card)} · {describeRole(getRoleLabel(card))}</span></div><span className="deck-quantity">×{quantity}</span>{card.id !== deck.commanderId && <button aria-label={`Remove ${card.name}`} className="remove-card" onClick={() => removeDeckCard(card.id)}>×</button>}</div>)}</div>
+                <aside className="deck-aside"><div className="panel-title"><strong>Owned cards to add</strong><span>{inventory.length} available</span></div><label className="search-box"><span>⌕</span><input value={collectionQuery} onChange={(event) => setCollectionQuery(event.target.value)} placeholder="Search cards…" /></label><div className="available-list">{inventory.filter((card) => {
+                  const entry = deck.cards.find((item) => item.cardId === card.id)
+                  return card.id !== deck.commanderId && (!entry || (/Basic Land/i.test(card.typeLine) && entry.quantity < (collection[card.id] ?? 0)))
+                }).map((card) => <div className="available-card" key={card.id}><span className={`role-dot role-${getRoleLabel(card)}`} /><span>{card.name}</span><span className="available-qty">×{collection[card.id]}</span><button aria-label={`Add ${card.name}`} onClick={() => addOwnedCardToDeck(card.id)}>＋</button></div>)}</div><div className="tip-box"><span>✧</span><p><strong>Why these cards?</strong><br />Cards are owned and inside the commander’s color identity. Recommendations are a starting point—edit them freely.</p></div></aside></div>
+            </section>}
           </>
         ) : (
-          <div className="collection-view"><div className="collection-tools"><label className="search-box"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search your cards…" /></label><button className="button button-outline" onClick={exportCollection}>Export collection ↓</button><button className="button button-primary" onClick={() => setShowImport(true)}>Import CSV ＋</button></div><div className="collection-table"><div className="collection-head"><span>Card</span><span>Type / role</span><span>Quantity</span><span>Adjust</span></div>{inventory.map((card) => <div className="collection-row" key={card.id}><strong>{card.name}</strong><span>{card.typeLine} · {getRoleLabel(card)}</span><span>×{collection[card.id]}</span><div className="quantity-control"><button onClick={() => decrement(card.id)} aria-label={`Remove one ${card.name}`}>−</button><button onClick={() => increment(card.id)} aria-label={`Add one ${card.name}`}>＋</button></div></div>)}{inventory.length === 0 && <div className="empty-state">No matching cards. Import a supported CSV or change your search.</div>}</div><p className="privacy-footnote">Your collection is stored locally in this browser. Export a backup before clearing browser data.</p></div>
+          <div className="collection-view"><div className="collection-tools"><label className="search-box"><span>⌕</span><input value={collectionQuery} onChange={(event) => setCollectionQuery(event.target.value)} placeholder="Search your cards…" /></label><button className="button button-outline" onClick={exportCollection}>Export collection ↓</button><button className="button button-primary" onClick={() => setShowImport(true)}>Import CSV ＋</button></div><div className="collection-table"><div className="collection-head"><span>Card</span><span>Type / role</span><span>Quantity</span><span>Adjust</span></div>{inventory.map((card) => <div className="collection-row" key={card.id}><strong>{card.name}</strong><span>{card.typeLine} · {getRoleLabel(card)}</span><span>×{collection[card.id]}</span><div className="quantity-control"><button onClick={() => decrement(card.id)} aria-label={`Remove one ${card.name}`}>−</button><button onClick={() => increment(card.id)} aria-label={`Add one ${card.name}`}>＋</button></div></div>)}{inventory.length === 0 && <div className="empty-state">No matching cards. Search the card catalog or import a supported CSV.</div>}</div><p className="privacy-footnote">Your collection is stored locally in this browser. Export a backup before clearing browser data.</p></div>
         )}
       </section>
 
-      <footer className="footer"><a className="brand" href="#top"><span className="brand-mark">✦</span><span>spellbook</span></a><span>Made for the decks you haven't built yet.</span><span>Collection stays on this device</span></footer>
+      <footer className="footer"><a className="brand" href="#top"><span className="brand-mark">✦</span><span>spellbook</span></a><span>One home for your cards and decks.</span><span>Collection stays on this device</span></footer>
 
       {notice && <div className="toast" role="status"><span>✦</span>{notice}<button onClick={() => setNotice('')} aria-label="Dismiss notice">×</button></div>}
-      {showImport && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setShowImport(false) }}><section className="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><button className="modal-close" onClick={() => setShowImport(false)} aria-label="Close">×</button><div className="eyebrow"><span>COLLECTION SETUP</span></div><h2 id="import-title">Bring your cards in.</h2><p>Choose a CSV with a card name and quantity column. Your file is read in this browser and isn’t uploaded.</p><div className="csv-example"><span>name,quantity</span><br />Arcane Signet,1<br />Island,8</div><label className="button button-primary file-button">Choose CSV file<input type="file" accept=".csv,text/csv" onChange={(event) => { handleImport(event.target.files?.[0]); if (event.target.files?.[0]) setShowImport(false) }} /></label>{importErrors.length > 0 && <ul className="import-errors">{importErrors.map((error, index) => <li key={index}>{error}</li>)}</ul>}<button className="text-button sample-reset" onClick={() => { saveCollection(sampleCollection, 'Sample collection restored.'); setShowImport(false) }}>Restore sample collection</button></section></div>}
+      {showImport && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setShowImport(false) }}><section className="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><button className="modal-close" onClick={() => setShowImport(false)} aria-label="Close">×</button><div className="eyebrow"><span>COLLECTION SETUP</span></div><h2 id="import-title">Bring your cards in.</h2><p>Choose a CSV with a card name and quantity column. Your file is read in this browser and isn’t uploaded. Import adds quantities to the existing inventory.</p><div className="csv-example"><span>name,quantity</span><br />Arcane Signet,1<br />Island,8</div><label className="button button-primary file-button">Choose CSV file<input ref={fileInput} type="file" accept=".csv,text/csv" onChange={(event) => handleImport(event.target.files?.[0])} /></label>{importErrors.length > 0 && <ul className="import-errors">{importErrors.map((error, index) => <li key={index}>{error}</li>)}</ul>}<button className="text-button sample-reset" onClick={resetSampleCollection}>Restore sample collection</button></section></div>}
+      {showDeckImport && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setShowDeckImport(false) }}><section className="import-modal deck-import-modal" role="dialog" aria-modal="true" aria-labelledby="deck-import-title"><button className="modal-close" onClick={() => setShowDeckImport(false)} aria-label="Close">×</button><div className="eyebrow"><span>DECK LIBRARY</span></div><h2 id="deck-import-title">Import a deck list.</h2><p>Paste a plain text list. Add a “Commander: Card Name” line. Card names must exist in your loaded catalog.</p><textarea value={deckImportText} onChange={(event) => setDeckImportText(event.target.value)} placeholder={'Commander: Alela, Artful Provocateur\n1 Sol Ring\n1 Arcane Signet\n36 Island'} aria-label="Deck list text" /><button className="button button-primary" onClick={importDeckList}>Import into deck library</button>{deckImportErrors.length > 0 && <ul className="import-errors">{deckImportErrors.map((error, index) => <li key={index}>{error}</li>)}</ul>}</section></div>}
     </main>
   )
 }

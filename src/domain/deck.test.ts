@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildDeck, findOwnedCommanders, importCollectionCsv, validateDeck, type Card, type Collection, type Deck } from './deck'
+import { buildDeck, findOwnedCommanders, importCollectionCsv, mergeCollection, validateDeck, type Card, type Collection, type Deck } from './deck'
 
 const cards: Card[] = [
   { id: 'commander', name: 'Alela, Artful Provocateur', typeLine: 'Legendary Creature — Faerie Wizard', colorIdentity: ['W', 'U', 'B'], manaValue: 3, commanderLegal: true, roles: ['commander', 'synergy'] },
@@ -67,6 +67,10 @@ describe('collection helpers', () => {
 
   it('only lists owned legal commanders', () => {
     expect(findOwnedCommanders(cards, { commander: 1, banned: 1 }).map((card) => card.id)).toEqual(['commander'])
+  })
+
+  it('adds newly acquired cards to existing inventory instead of replacing it', () => {
+    expect(mergeCollection({ ramp: 1, draw: 2 }, { ramp: 1 })).toEqual({ ramp: 2, draw: 2 })
   })
 })
 

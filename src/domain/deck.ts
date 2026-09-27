@@ -9,9 +9,23 @@ export interface Card {
   manaValue: number
   commanderLegal: boolean
   roles: CardRole[]
+  oracleText?: string
+  setCode?: string
+  collectorNumber?: string
+  scryfallId?: string
+  imageUrl?: string
+  source?: 'scryfall' | 'sample'
 }
 
 export type Collection = Record<string, number>
+
+export function mergeCollection(current: Collection, incoming: Collection): Collection {
+  const merged = { ...current }
+  for (const [cardId, quantity] of Object.entries(incoming)) {
+    merged[cardId] = (merged[cardId] ?? 0) + quantity
+  }
+  return merged
+}
 
 export interface DeckCard {
   cardId: string
@@ -171,7 +185,7 @@ export function importCollectionCsv(csv: string, cards: Card[]): { collection: C
 }
 
 export const sampleCards: Card[] = [
-  { id: 'alela', name: 'Alela, Artful Provocateur', typeLine: 'Legendary Creature — Faerie Wizard', colorIdentity: ['W', 'U', 'B'], manaValue: 3, commanderLegal: true, roles: ['commander', 'synergy'] },
+  { id: 'alela', name: 'Alela, Artful Provocateur', typeLine: 'Legendary Creature — Faerie Wizard', colorIdentity: ['W', 'U', 'B'], manaValue: 3, commanderLegal: true, roles: ['commander', 'synergy'], source: 'sample', oracleText: 'Whenever you cast an artifact or enchantment spell, create a 1/1 blue Faerie creature token with flying. Other creatures you control with flying get +1/+0.' },
   { id: 'arcane-signet', name: 'Arcane Signet', typeLine: 'Artifact', colorIdentity: [], manaValue: 2, commanderLegal: true, roles: ['ramp'] },
   { id: 'sol-ring', name: 'Sol Ring', typeLine: 'Artifact', colorIdentity: [], manaValue: 1, commanderLegal: true, roles: ['ramp'] },
   { id: 'painful-truths', name: 'Painful Truths', typeLine: 'Sorcery', colorIdentity: ['B'], manaValue: 3, commanderLegal: true, roles: ['draw'] },

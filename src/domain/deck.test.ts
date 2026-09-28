@@ -24,6 +24,11 @@ describe('buildDeck', () => {
     expect(() => buildDeck(cards, { ramp: 1 }, 'commander')).toThrow('Commander must be in your collection')
   })
 
+  it('rejects a format-legal card that is not commander eligible', () => {
+    const ordinary = { ...cards[1], id: 'ordinary-legend', name: 'Legendary Artifact', typeLine: 'Legendary Artifact', roles: ['flex' as const] }
+    expect(() => buildDeck([...cards, ordinary], { 'ordinary-legend': 1 }, 'ordinary-legend')).toThrow(/not eligible to be a Commander/)
+  })
+
   it('uses multiple owned copies of basic lands to fill available slots', () => {
     const deck = buildDeck(cards, { commander: 1, plains: 3 }, 'commander')
     expect(deck.cards.find((card) => card.cardId === 'plains')?.quantity).toBe(3)
@@ -37,6 +42,12 @@ describe('buildDeck', () => {
 })
 
 describe('validateDeck', () => {
+  it('rejects a format-legal non-commander as commander', () => {
+    const ordinary = { ...cards[1], id: 'ordinary-legend', name: 'Legendary Artifact', typeLine: 'Legendary Artifact', roles: ['flex' as const] }
+    const deck: Deck = { commanderId: 'ordinary-legend', complete: false, missing: 99, cards: [{ cardId: 'ordinary-legend', quantity: 1 }] }
+    expect(validateDeck(deck, [...cards, ordinary], { 'ordinary-legend': 1 }).some((issue) => issue.code === 'commander')).toBe(true)
+  })
+
   it('reports unowned, illegal, and off-color cards', () => {
     const deck: Deck = {
       commanderId: 'commander', complete: false, missing: 0,

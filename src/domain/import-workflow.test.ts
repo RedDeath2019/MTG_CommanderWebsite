@@ -10,6 +10,15 @@ const row: ResolvedMoxfieldRow = {
 const card = { ...sampleCards[1], id: 'oracle-aang', name: 'Aang', typeLine: 'Legendary Creature — Human Avatar', roles: ['commander' as const], commanderLegal: true }
 
 describe('apply Moxfield import', () => {
+  it('uses one canonical card ID for same-name catalog records and collection entries', () => {
+    const sameNameCard = { ...sampleCards[1], id: 'old-catalog-id', name: 'Aang' }
+    const result = applyMoxfieldImport({ cards: [...sampleCards, sameNameCard], collection: sampleCollection, inventory: [] }, [row], [card], 'add')
+    expect(result.collection['old-catalog-id']).toBe(2)
+    expect(result.collection['oracle-aang']).toBeUndefined()
+    expect(result.cards.some((item) => item.id === 'old-catalog-id' && item.name === 'Aang')).toBe(true)
+    expect(result.inventory[0].cardId).toBe('old-catalog-id')
+  })
+
   it('merges resolved card records before storing their collection IDs', () => {
     const result = applyMoxfieldImport({ cards: sampleCards, collection: sampleCollection, inventory: [] }, [row], [card], 'add')
     expect(result.collection['oracle-aang']).toBe(2)

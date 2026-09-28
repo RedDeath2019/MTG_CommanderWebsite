@@ -66,3 +66,34 @@ test('refuses confirmation if all exact printing lookups fail', async ({ page })
   await expect(dialog.getByRole('button', { name: /Confirm/ })).toHaveCount(0)
   await expect(page.locator('.stat').first().locator('strong')).toHaveText(initialTotal)
 })
+
+test('does not offer a replacement for a partial set of matched rows', async ({ page }) => {
+  await page.route('https://api.scryfall.com/cards/collection', async (route) => {
+    const body = route.request().postDataJSON() as { identifiers: Array<{ set: string; collector_number: string }> }
+    const data = body.identifiers.flatMap(({ set, collector_number }) => {
+      const card = knownPrintings[`${set}/${collector_number}`]
+      return card ? [card] : []
+    })
+    const found = new Set(data.map((card) => `${card.set}/${card.collector_number}`))
+    const not_found = body.identifiers.filter(({ set, collector_number }) => !found.has(`${set}/${collector_number}`))
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ data, not_found }) })
+  })
+  await page.goto('/')
+  await expect(page.getByRole('button', { name: 'My collection' })).toBeVisible()
+  await page.getByRole('button', { name: 'My collection' }).click()
+  const startingCount = await page.locator('.stat').first().locator('strong').innerText()
+  await page.getByRole('button', { name: 'Import CSV ＋' }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.getByLabel('Choose CSV file').setInputFiles(resolve('tests/fixtures/moxfield-partial.csv'))
+  await expect(dialog.getByRole('region', { name: 'Review Moxfield import' })).toBeVisible()
+  await expect(dialog.getByText(/Replace is disabled/)).toBeVisible()
+  await expect(dialog.getByLabel('Replace current collection')).toBeDisabled()
+  await expect(dialog.getByLabel('Add to current collection')).toBeEnabled()
+  await dialog.getByLabel('Add to current collection').check()
+  await expect(dialog.getByRole('button', { name: /Confirm addition/ })).toBeEnabled()
+  await expect(page.locator('.stat').first().locator('strong')).toHaveText(startingCount)
+  await dialog.getByRole('button', { name: /Confirm addition/ }).click()
+  await expect(page.getByRole('status')).toContainText('Added 1 card from Moxfield')
+  await page.getByRole('button', { name: 'My collection' }).click()
+  await expect(page.locator('.collection-row').filter({ hasText: 'Aang, A Lot to Learn' })).toBeVisible()
+})

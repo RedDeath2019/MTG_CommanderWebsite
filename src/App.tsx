@@ -348,7 +348,8 @@ function App() {
         totals[row.cardId] = (totals[row.cardId] ?? 0) + row.count
         return totals
       }, {})).reduce((sum, count) => sum + count, 0)
-      setNotice(`${mode === 'replace' ? 'Replaced collection with' : 'Added'} ${importedCount.toLocaleString()} cards from Moxfield.`)
+      const cardLabel = importedCount === 1 ? 'card' : 'cards'
+      setNotice(`${mode === 'replace' ? 'Replaced collection with' : 'Added'} ${importedCount.toLocaleString()} ${cardLabel} from Moxfield.`)
     } catch (error) {
       setNotice(error instanceof Error ? `Import rejected: ${error.message}` : 'Import rejected: invalid card quantities.')
     }

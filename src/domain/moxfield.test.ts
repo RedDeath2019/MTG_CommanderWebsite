@@ -13,6 +13,7 @@ const scryfallSolRing = {
   id: 'print-sol-ring', oracle_id: 'sol-ring', name: 'Sol Ring', type_line: 'Artifact',
   color_identity: [], cmc: 1, legalities: { commander: 'legal' }, set: 'cmm', collector_number: '396',
 }
+const makeInventoryRow = { tradeCount: 0, name: 'Sol Ring', edition: 'cmm', condition: 'Near Mint', language: 'English', foil: false, tags: '', collectorNumber: '396', alter: false, proxy: false }
 
 describe('Moxfield collection import', () => {
   it('recognizes Moxfield headers and parses quantities, price, finish, and printing metadata', () => {
@@ -25,6 +26,33 @@ describe('Moxfield collection import', () => {
     const commaName = parseMoxfieldCsv([HEADER, '1,0,"Name, with comma",cmm,Near Mint,English,,,,396,False,False,'].join('\n'))
     expect(commaName.rows[0].name).toBe('Name, with comma')
     expect(result.errors).toEqual([])
+  })
+
+  it('keeps separate purchase prices as distinct inventory lots', () => {
+    const result = parseMoxfieldCsv([
+      HEADER,
+      '1,0,Sol Ring,cmm,Near Mint,English,,,,396,False,False,1.25',
+      '1,0,Sol Ring,cmm,Near Mint,English,,,,396,False,False,2.50',
+    ].join('\n'))
+    expect(result.rows).toHaveLength(2)
+    expect(result.rows.map((entry) => entry.purchasePrice)).toEqual([1.25, 2.5])
+  })
+
+  it('rejects counts and duplicate aggregate totals outside safe integer range', () => {
+    const rowCount = parseMoxfieldCsv([HEADER, '9007199254740992,0,Sol Ring,cmm,Near Mint,English,,,,396,False,False,'].join('\n'))
+    expect(rowCount.rows).toEqual([])
+    expect(rowCount.errors[0]).toMatch(/positive safe whole number/)
+    const overflow = parseMoxfieldCsv([HEADER,
+      '9007199254740991,0,Sol Ring,cmm,Near Mint,English,,,,396,False,False,',
+      '1,0,Sol Ring,cmm,Near Mint,English,,,,396,False,False,',
+    ].join('\n'))
+    expect(overflow.rows).toEqual([])
+    expect(overflow.errors[0]).toMatch(/safe integer/)
+
+    expect(() => mergeMoxfieldInventory(
+      [{ count: Number.MAX_SAFE_INTEGER, cardId: 'x', ...makeInventoryRow }],
+      [{ count: 1, cardId: 'x', ...makeInventoryRow }],
+    )).toThrow(/safe integer/)
   })
 
   it('aggregates duplicate inventory rows only when printing and finish metadata match', () => {

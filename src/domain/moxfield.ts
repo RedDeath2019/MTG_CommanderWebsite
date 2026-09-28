@@ -86,6 +86,7 @@ export function parseMoxfieldCsv(csv: string): MoxfieldCsvResult {
   const column = (name: string) => headers.indexOf(name)
   const get = (record: string[], name: string) => record[column(name)]?.trim() ?? ''
   const uniqueRows = new Map<string, MoxfieldRow>()
+  const overflowedKeys = new Set<string>()
   const errors: string[] = []
 
   records.slice(1).forEach((record, index) => {
@@ -98,8 +99,8 @@ export function parseMoxfieldCsv(csv: string): MoxfieldCsvResult {
     const name = get(record, 'name')
     const edition = get(record, 'edition').toLocaleLowerCase()
     const collectorNumber = get(record, 'collector number')
-    if (!Number.isInteger(count) || count < 1) {
-      errors.push(`Row ${rowNumber}: Count must be a positive whole number.`)
+    if (!Number.isSafeInteger(count) || count < 1) {
+      errors.push(`Row ${rowNumber}: Count must be a positive safe whole number.`)
       return
     }
     if (!name || !edition || !collectorNumber) {
@@ -127,10 +128,17 @@ export function parseMoxfieldCsv(csv: string): MoxfieldCsvResult {
       proxy: bool(get(record, 'proxy')),
       ...(purchasePrice === undefined ? {} : { purchasePrice }),
     }
-    const key = JSON.stringify([edition, collectorNumber, row.foil, row.condition, row.language, row.alter, row.proxy, row.tags, row.tradeCount])
+    const key = JSON.stringify([edition, collectorNumber, row.foil, row.condition, row.language, row.alter, row.proxy, row.tags, row.tradeCount, row.purchasePrice ?? null])
     const existing = uniqueRows.get(key)
-    if (existing) existing.count += count
-    else uniqueRows.set(key, row)
+    if (existing) {
+      const total = existing.count + count
+      if (!Number.isSafeInteger(total)) {
+        uniqueRows.delete(key)
+        overflowedKeys.add(key)
+        errors.push(`Row ${rowNumber}: aggregated Count exceeds the safe integer limit.`)
+      }
+      else existing.count = total
+    } else if (!overflowedKeys.has(key)) uniqueRows.set(key, row)
   })
   return { rows: [...uniqueRows.values()], errors }
 }
@@ -166,12 +174,17 @@ export function resolveMoxfieldRows(rows: MoxfieldRow[], printings: ScryfallCard
 
 export function collectionFromMoxfieldRows(rows: ResolvedMoxfieldRow[]): Record<string, number> {
   const collection: Record<string, number> = {}
-  for (const row of rows) collection[row.cardId] = (collection[row.cardId] ?? 0) + row.count
+  for (const row of rows) {
+    if (!Number.isSafeInteger(row.count) || row.count < 1) throw new Error(`Invalid imported count for ${row.name}.`)
+    const total = (collection[row.cardId] ?? 0) + row.count
+    if (!Number.isSafeInteger(total)) throw new Error(`Imported quantity for ${row.name} exceeds the safe integer limit.`)
+    collection[row.cardId] = total
+  }
   return collection
 }
 
 export function moxfieldInventoryKey(row: ResolvedMoxfieldRow): string {
-  return JSON.stringify([row.cardId, row.edition, row.collectorNumber, row.foil, row.condition, row.language, row.alter, row.proxy, row.tags, row.tradeCount])
+  return JSON.stringify([row.cardId, row.edition, row.collectorNumber, row.foil, row.condition, row.language, row.alter, row.proxy, row.tags, row.tradeCount, row.purchasePrice ?? null])
 }
 
 export function mergeMoxfieldInventory(current: ResolvedMoxfieldRow[], incoming: ResolvedMoxfieldRow[]): ResolvedMoxfieldRow[] {
@@ -179,7 +192,11 @@ export function mergeMoxfieldInventory(current: ResolvedMoxfieldRow[], incoming:
   for (const row of incoming) {
     const key = moxfieldInventoryKey(row)
     const existing = merged.get(key)
-    if (existing) existing.count += row.count
+    if (existing) {
+      const total = existing.count + row.count
+      if (!Number.isSafeInteger(total)) throw new Error(`Inventory quantity for ${row.name} exceeds the safe integer limit.`)
+      existing.count = total
+    }
     else merged.set(key, { ...row })
   }
   return [...merged.values()]

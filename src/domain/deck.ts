@@ -53,10 +53,17 @@ export interface DeckIssue {
 
 const roleOrder: CardRole[] = ['land', 'ramp', 'draw', 'removal', 'wipe', 'protection', 'synergy', 'flex']
 
+export function isCommanderEligible(card: Card): boolean {
+  return card.roles.includes('commander')
+    || (/Legendary/i.test(card.typeLine) && /Creature/i.test(card.typeLine))
+    || /can be your commander/i.test(card.oracleText ?? '')
+}
+
 export function buildDeck(cards: Card[], collection: Collection, commanderId: string): Deck {
   const commander = cards.find((card) => card.id === commanderId)
   if (!commander || !collection[commanderId]) throw new Error('Commander must be in your collection')
   if (!commander.commanderLegal) throw new Error('Selected commander is not legal in Commander')
+  if (!isCommanderEligible(commander)) throw new Error('Selected card is not eligible to be a Commander')
 
   const allowedColors = new Set(commander.colorIdentity)
   const basicLandException = new Set(['Plains', 'Island', 'Swamp', 'Mountain', 'Forest', 'Wastes'])
@@ -95,7 +102,7 @@ export function validateDeck(deck: Deck, cards: Card[], collection: Collection):
   const cardById = new Map(cards.map((card) => [card.id, card]))
   const commander = cardById.get(deck.commanderId)
   const commanderEntries = deck.cards.filter((entry) => entry.cardId === deck.commanderId)
-  if (!commander || !commander.commanderLegal || commanderEntries.length !== 1 || commanderEntries[0].quantity !== 1) {
+  if (!commander || !commander.commanderLegal || !isCommanderEligible(commander) || commanderEntries.length !== 1 || commanderEntries[0].quantity !== 1) {
     issues.push({ code: 'commander', cardId: deck.commanderId, message: 'Deck must contain one legal commander.' })
   }
   const allowedColors = new Set(commander?.colorIdentity ?? [])
@@ -153,7 +160,7 @@ export function exportDeckList(deck: Deck, cards: Card[]): string {
 }
 
 export function findOwnedCommanders(cards: Card[], collection: Collection): Card[] {
-  return cards.filter((card) => card.commanderLegal && card.roles.includes('commander') && (collection[card.id] ?? 0) > 0)
+  return cards.filter((card) => card.commanderLegal && isCommanderEligible(card) && (collection[card.id] ?? 0) > 0)
 }
 
 

@@ -28,29 +28,30 @@ export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport
     setRows([])
     setResolvedCards([])
     setProgress('')
-    const text = await file.text()
-    const parsed = parseMoxfieldCsv(text)
-    if (parsed.errors.length && !parsed.rows.length) {
-      setErrors(parsed.errors)
-      return
-    }
-    if (!looksLikeMoxfieldCsv(text)) {
-      if (onLegacyImport) onLegacyImport(file)
-      else setErrors(['This is not a Moxfield export. Expected Moxfield inventory columns.'])
-      return
-    }
-    setErrors(parsed.errors)
-    setRows([])
-    setMode('replace')
     setLoading(true)
     try {
+      const text = await file.text()
+      if (!looksLikeMoxfieldCsv(text)) {
+        if (onLegacyImport) onLegacyImport(file)
+        else setErrors(['This is not a Moxfield export. Expected Moxfield inventory columns.'])
+        return
+      }
+      const parsed = parseMoxfieldCsv(text)
+      if (parsed.errors.length > 0 && parsed.rows.length === 0) {
+        setErrors(parsed.errors)
+        return
+      }
+      setErrors(parsed.errors)
+      setMode('replace')
       const lookup = await lookupMoxfieldPrintings(parsed.rows, undefined, (current, total) => setProgress(formatLookupProgress(current, total)), 500)
       const resolved = resolveMoxfieldRows(parsed.rows, lookup.cards)
       setRows(resolved.rows)
       setResolvedCards(resolved.cards)
-      setErrors([...parsed.errors, ...lookup.errors, ...resolved.errors])
+      const allErrors = [...parsed.errors, ...lookup.errors, ...resolved.errors]
+      setErrors(allErrors)
+      if (allErrors.length > 0) setMode('add')
     } catch (error) {
-      setErrors([...parsed.errors, error instanceof Error ? error.message : 'Could not resolve card printings.'])
+      setErrors([error instanceof Error ? error.message : 'Could not read or resolve this CSV.'])
     } finally {
       setLoading(false)
       if (inputRef.current) inputRef.current.value = ''
@@ -68,9 +69,10 @@ export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport
       {loading && <div className="moxfield-progress" role="status">{progress || 'Resolving set and collector numbers with Scryfall. Large exports may take a few minutes…'}</div>}
       {rows.length > 0 && <section className="moxfield-review" aria-label="Review Moxfield import">
         <div className="moxfield-review-heading"><strong>Review import</strong><span>{rows.length.toLocaleString()} groups matched · {total.toLocaleString()} cards</span></div>
-        <div className="moxfield-mode"><label><input type="radio" name="import-mode" checked={mode === 'replace'} onChange={() => setMode('replace')} /> Replace current collection</label><label><input type="radio" name="import-mode" checked={mode === 'add'} onChange={() => setMode('add')} /> Add to current collection</label></div>
+        {errors.length > 0 && <p role="alert" className="moxfield-partial-warning">Some export rows could not be imported. Replace is disabled to protect your existing collection; choose Add to keep the matched cards, or fix the reported rows and retry.</p>}
+        <div className="moxfield-mode"><label><input type="radio" name="import-mode" checked={mode === 'replace'} disabled={errors.length > 0} onChange={() => setMode('replace')} /> Replace current collection</label><label><input type="radio" name="import-mode" checked={mode === 'add'} onChange={() => setMode('add')} /> Add to current collection</label></div>
         <div className="moxfield-preview">{rows.slice(0, 10).map((row, index) => <div key={`${row.cardId}-${row.edition}-${row.collectorNumber}-${row.foil}-${index}`}><span>{row.name}</span><small>{row.edition.toUpperCase()} #{row.collectorNumber} · {row.foil ? 'Foil' : 'Nonfoil'} · {row.condition} · {row.language}</small><b>×{row.count}</b></div>)}{rows.length > 10 && <p>And {(rows.length - 10).toLocaleString()} more groups…</p>}</div>
-        <div className="moxfield-review-actions"><button className="button button-outline" onClick={() => setRows([])}>Cancel review</button><button className="button button-primary" onClick={() => onImport(rows, mode, resolvedCards)}>Confirm {mode === 'replace' ? 'replacement' : 'addition'}</button></div>
+        <div className="moxfield-review-actions"><button className="button button-outline" onClick={() => setRows([])}>Cancel review</button><button className="button button-primary" disabled={errors.length > 0 && mode === 'replace'} onClick={() => onImport(rows, mode, resolvedCards)}>Confirm {mode === 'replace' ? 'replacement' : 'addition'}</button></div>
       </section>}
       {errors.length > 0 && <ul className="import-errors">{errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
       {!rows.length && <div className="csv-example"><span>CSV format</span><br />Moxfield export or name,quantity</div>}

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useMemo, useRef, useState } from 'react'
 import {
   CachedCardCatalog,
   scryfallCatalog,
@@ -11,6 +11,7 @@ import {
   resolveCollectionCardId,
 } from './domain/scryfall'
 import { deleteSavedDeck, getSavedDeckId, parseDeckList, upsertSavedDeck, type SavedDeck } from './domain/workspace'
+import { collectionFromMoxfieldRows, mergeMoxfieldInventory, type ResolvedMoxfieldRow } from './domain/moxfield'
 import {
   buildDeck,
   describeRole,
@@ -31,9 +32,11 @@ import './App.css'
 import './catalog.css'
 import './workspace.css'
 import './decks.css'
+import './moxfield.css'
 
 const STORAGE_KEY = 'spellbook-collection-v1'
 const cardCatalog = new CachedCardCatalog(scryfallCatalog)
+const MoxfieldImportDialog = lazy(() => import('./MoxfieldImportDialog'))
 
 type View = 'collection' | 'builder' | 'catalog'
 
@@ -44,6 +47,7 @@ interface SavedState {
   cards: Card[]
   savedDecks: SavedDeck[]
   activeSavedDeckId: string
+  moxfieldInventory: ResolvedMoxfieldRow[]
 }
 
 function loadSavedState(): SavedState {
@@ -58,12 +62,13 @@ function loadSavedState(): SavedState {
         cards: mergeCards(sampleCards, saved.cards ?? []),
         savedDecks: saved.savedDecks ?? [],
         activeSavedDeckId: saved.activeSavedDeckId ?? '',
+        moxfieldInventory: saved.moxfieldInventory ?? [],
       }
     }
   } catch {
     // Keep the app usable if browser storage is unavailable or malformed.
   }
-  return { collection: sampleCollection, deck: null, selectedCommander: 'alela', cards: sampleCards, savedDecks: [], activeSavedDeckId: '' }
+  return { collection: sampleCollection, deck: null, selectedCommander: 'alela', cards: sampleCards, savedDecks: [], activeSavedDeckId: '', moxfieldInventory: [] }
 }
 
 function App() {
@@ -73,6 +78,7 @@ function App() {
   const [deck, setDeck] = useState<Deck | null>(initial.deck)
   const [savedDecks, setSavedDecks] = useState<SavedDeck[]>(initial.savedDecks)
   const [activeSavedDeckId, setActiveSavedDeckId] = useState(initial.activeSavedDeckId)
+  const [moxfieldInventory, setMoxfieldInventory] = useState(initial.moxfieldInventory)
   const [deckName, setDeckName] = useState('')
   const [deckNameError, setDeckNameError] = useState('')
   const [showDeckImport, setShowDeckImport] = useState(false)
@@ -89,10 +95,8 @@ function App() {
   const [addQuantity, setAddQuantity] = useState(1)
   const [newCommanders, setNewCommanders] = useState<string[]>([])
   const [showImport, setShowImport] = useState(false)
-  const [importErrors, setImportErrors] = useState<string[]>([])
   const [notice, setNotice] = useState('')
   const searchSequence = useRef(0)
-  const fileInput = useRef<HTMLInputElement>(null)
 
   const cardById = (id: string) => cards.find((card) => card.id === id)
   const commanders = findOwnedCommanders(cards, collection)
@@ -109,7 +113,7 @@ function App() {
     colorIdentity: commander.colorIdentity,
   }] : []
 
-  function persist(nextCollection: Collection, nextDeck = deck, nextCommander = selectedCommander, nextCards = cards, nextSavedDecks = savedDecks, nextActiveDeckId = activeSavedDeckId) {
+  function persist(nextCollection: Collection, nextDeck = deck, nextCommander = selectedCommander, nextCards = cards, nextSavedDecks = savedDecks, nextActiveDeckId = activeSavedDeckId, nextMoxfieldInventory = moxfieldInventory) {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         collection: nextCollection,
@@ -118,6 +122,7 @@ function App() {
         cards: nextCards,
         savedDecks: nextSavedDecks,
         activeSavedDeckId: nextActiveDeckId,
+        moxfieldInventory: nextMoxfieldInventory,
       }))
     } catch {
       setNotice('Browser storage is full or unavailable. Export a collection backup to keep your changes.')
@@ -310,35 +315,40 @@ function App() {
       : `Added ${addQuantity} × ${card.name} to your collection.`)
   }
 
-  function handleImport(file?: File) {
-    if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      const parsed = importCollectionCsv(String(reader.result ?? ''), cards)
-      setImportErrors(parsed.errors)
-      if (Object.keys(parsed.collection).length === 0) {
-        if (!parsed.errors.length) setNotice('No recognized cards were imported.')
+  function openImport() {
+    setShowImport(true)
+  }
+
+  function applyMoxfieldImport(rows: ResolvedMoxfieldRow[], mode: 'replace' | 'add') {
+    const imported = collectionFromMoxfieldRows(rows)
+    const nextCollection = mode === 'replace' ? imported : mergeCollection(collection, imported)
+    const nextInventory = mode === 'replace' ? rows : mergeMoxfieldInventory(moxfieldInventory, rows)
+    const unlocked = newlyEnabledCommanders(collection, nextCollection, cards).map((card) => card.name)
+    setCollection(nextCollection)
+    setMoxfieldInventory(nextInventory)
+    setNewCommanders(unlocked)
+    persist(nextCollection, deck, selectedCommander, cards, savedDecks, activeSavedDeckId, nextInventory)
+    setShowImport(false)
+    setNotice(`${mode === 'replace' ? 'Replaced collection with' : 'Added'} ${Object.values(imported).reduce((sum, count) => sum + count, 0).toLocaleString()} cards from Moxfield.`)
+  }
+
+  function importLegacyCsv(file: File) {
+    void file.text().then((text) => {
+      const parsed = importCollectionCsv(text, cards)
+      if (parsed.errors.length) {
+        setNotice(`Could not import ${file.name}: ${parsed.errors.slice(0, 3).join(' ')}`)
+        return
+      }
+      if (!Object.keys(parsed.collection).length) {
+        setNotice(`No recognizable card rows found in ${file.name}.`)
         return
       }
       const updated = mergeCollection(collection, parsed.collection)
-      const unlocked = newlyEnabledCommanders(collection, updated, cards).map((entry) => entry.name)
-      setNewCommanders(unlocked)
       setCollection(updated)
-      setDeck(null)
-      let nextSavedDecks = savedDecks
-      if (deck && activeSavedDeckId) {
-        nextSavedDecks = savedDecks.map((saved) => saved.id === activeSavedDeckId
-          ? { ...saved, deck, updatedAt: new Date().toISOString() }
-          : saved)
-        setSavedDecks(nextSavedDecks)
-      }
-      setActiveSavedDeckId('')
-      persist(updated, null, '', cards, nextSavedDecks, '')
-      setNotice(`Added ${Object.values(parsed.collection).reduce((sum, count) => sum + count, 0)} cards from ${file.name}.`)
-      if (!parsed.errors.length) setShowImport(false)
-    }
-    reader.readAsText(file)
-    if (fileInput.current) fileInput.current.value = ''
+      persist(updated)
+      setNotice(`Added ${Object.values(parsed.collection).reduce((sum, count) => sum + count, 0).toLocaleString()} cards from ${file.name}.`)
+      setShowImport(false)
+    }).catch(() => setNotice(`Could not read ${file.name}.`))
   }
 
   function chooseCommander(cardId: string) {
@@ -368,14 +378,6 @@ function App() {
     if (deck) downloadFile('commander-deck.txt', exportDeckList(deck, cards), 'text/plain')
   }
 
-  function resetSampleCollection() {
-    setCollection(sampleCollection)
-    setDeck(null)
-    setSelectedCommander('alela')
-    persist(sampleCollection, null, 'alela')
-    setShowImport(false)
-    setNotice('Sample collection restored.')
-  }
 
   const totalOwned = Object.values(collection).reduce((sum, count) => sum + count, 0)
   const buildableCount = cards.filter((card) => card.id !== selectedCommander
@@ -430,12 +432,12 @@ function App() {
       <section className="workspace" id="workspace">
         <div className="section-heading">
           <div><div className="eyebrow"><span>01</span> YOUR MTG TOOLKIT</div><h2>{view === 'builder' ? 'Choose your commander' : view === 'collection' ? 'Your collection' : 'Card catalog'}</h2><p>{view === 'builder' ? 'Build an editable first draft using cards you own.' : view === 'collection' ? 'Your cards, quantities, and collection tools.' : 'Search the card catalog, add inventory, and see potential deck impact.'}</p></div>
-          <button className="text-button" onClick={() => view === 'catalog' ? setShowImport(true) : setView('catalog')}>{view === 'catalog' ? '＋ Import CSV' : '＋ Add cards'} <span>→</span></button>
+          <button className="text-button" onClick={() => view === 'catalog' ? openImport() : setView('catalog')}>{view === 'catalog' ? '＋ Import CSV' : '＋ Add cards'} <span>→</span></button>
         </div>
 
         {view === 'catalog' ? (
           <div className="catalog-view">
-            <div className="catalog-intro"><div><div className="eyebrow"><span>ADD TO YOUR LIVING COLLECTION</span></div><h2>Search cards. See what changes.</h2><p>Find a card, add it to inventory, and see possible deck fits or newly available commanders. Recommendations never modify decks automatically.</p></div><button className="button button-outline" onClick={() => { setImportErrors([]); setShowImport(true) }}>Import collection CSV</button></div>
+            <div className="catalog-intro"><div><div className="eyebrow"><span>ADD TO YOUR LIVING COLLECTION</span></div><h2>Search cards. See what changes.</h2><p>Find a card, add it to inventory, and see possible deck fits or newly available commanders. Recommendations never modify decks automatically.</p></div><button className="button button-outline" onClick={openImport}>Import collection CSV</button></div>
             <label className="catalog-search search-box"><span>⌕</span><input value={catalogQuery} onChange={(event) => void searchCards(event.target.value)} placeholder="Search any Magic card — e.g. Sol Ring…" aria-label="Search the card catalog" /></label>
             {catalogLoading && <div className="catalog-message">Searching Scryfall card data…</div>}
             {catalogError && <div className="catalog-message error">{catalogError} You can still manage your collection.</div>}
@@ -487,14 +489,15 @@ function App() {
             </section>}
           </>
         ) : (
-          <div className="collection-view"><div className="collection-tools"><label className="search-box"><span>⌕</span><input value={collectionQuery} onChange={(event) => setCollectionQuery(event.target.value)} placeholder="Search your cards…" /></label><button className="button button-outline" onClick={exportCollection}>Export collection ↓</button><button className="button button-primary" onClick={() => setShowImport(true)}>Import CSV ＋</button></div><div className="collection-table"><div className="collection-head"><span>Card</span><span>Type / role</span><span>Quantity</span><span>Adjust</span></div>{inventory.map((card) => <div className="collection-row" key={card.id}><strong>{card.name}</strong><span>{card.typeLine} · {getRoleLabel(card)}</span><span>×{collection[card.id]}</span><div className="quantity-control"><button onClick={() => decrement(card.id)} aria-label={`Remove one ${card.name}`}>−</button><button onClick={() => increment(card.id)} aria-label={`Add one ${card.name}`}>＋</button></div></div>)}{inventory.length === 0 && <div className="empty-state">No matching cards. Search the card catalog or import a supported CSV.</div>}</div><p className="privacy-footnote">Your collection is stored locally in this browser. Export a backup before clearing browser data.</p></div>
+          <div className="collection-view"><div className="collection-tools"><label className="search-box"><span>⌕</span><input value={collectionQuery} onChange={(event) => setCollectionQuery(event.target.value)} placeholder="Search your cards…" /></label><button className="button button-outline" onClick={exportCollection}>Export collection ↓</button><button className="button button-primary" onClick={openImport}>Import CSV ＋</button></div><div className="collection-table"><div className="collection-head"><span>Card</span><span>Type / role</span><span>Quantity</span><span>Adjust</span></div>{inventory.map((card) => <div className="collection-row" key={card.id}><strong>{card.name}</strong><span>{card.typeLine} · {getRoleLabel(card)}</span><span>×{collection[card.id]}</span><div className="quantity-control"><button onClick={() => decrement(card.id)} aria-label={`Remove one ${card.name}`}>−</button><button onClick={() => increment(card.id)} aria-label={`Add one ${card.name}`}>＋</button></div></div>)}{inventory.length === 0 && <div className="empty-state">No matching cards. Search the card catalog or import a supported CSV.</div>}</div><p className="privacy-footnote">Your collection is stored locally in this browser. Export a backup before clearing browser data.</p></div>
         )}
       </section>
 
       <footer className="footer"><a className="brand" href="#top"><span className="brand-mark">✦</span><span>spellbook</span></a><span>One home for your cards and decks.</span><span>Collection stays on this device</span></footer>
 
       {notice && <div className="toast" role="status"><span>✦</span>{notice}<button onClick={() => setNotice('')} aria-label="Dismiss notice">×</button></div>}
-      {showImport && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setShowImport(false) }}><section className="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title"><button className="modal-close" onClick={() => setShowImport(false)} aria-label="Close">×</button><div className="eyebrow"><span>COLLECTION SETUP</span></div><h2 id="import-title">Bring your cards in.</h2><p>Choose a CSV with a card name and quantity column. Your file is read in this browser and isn’t uploaded. Import adds quantities to the existing inventory.</p><div className="csv-example"><span>name,quantity</span><br />Arcane Signet,1<br />Island,8</div><label className="button button-primary file-button">Choose CSV file<input ref={fileInput} type="file" accept=".csv,text/csv" onChange={(event) => handleImport(event.target.files?.[0])} /></label>{importErrors.length > 0 && <ul className="import-errors">{importErrors.map((error, index) => <li key={index}>{error}</li>)}</ul>}<button className="text-button sample-reset" onClick={resetSampleCollection}>Restore sample collection</button></section></div>}
+      {showImport && <Suspense fallback={<div className="moxfield-progress">Loading collection import…</div>}><MoxfieldImportDialog onClose={() => setShowImport(false)} onLegacyImport={importLegacyCsv} onImport={applyMoxfieldImport} /></Suspense>}
+
       {showDeckImport && <div className="modal-backdrop" role="presentation" onClick={(event) => { if (event.target === event.currentTarget) setShowDeckImport(false) }}><section className="import-modal deck-import-modal" role="dialog" aria-modal="true" aria-labelledby="deck-import-title"><button className="modal-close" onClick={() => setShowDeckImport(false)} aria-label="Close">×</button><div className="eyebrow"><span>DECK LIBRARY</span></div><h2 id="deck-import-title">Import a deck list.</h2><p>Paste a plain text list. Add a “Commander: Card Name” line. Card names must exist in your loaded catalog.</p><textarea value={deckImportText} onChange={(event) => setDeckImportText(event.target.value)} placeholder={'Commander: Alela, Artful Provocateur\n1 Sol Ring\n1 Arcane Signet\n36 Island'} aria-label="Deck list text" /><button className="button button-primary" onClick={importDeckList}>Import into deck library</button>{deckImportErrors.length > 0 && <ul className="import-errors">{deckImportErrors.map((error, index) => <li key={index}>{error}</li>)}</ul>}</section></div>}
     </main>
   )

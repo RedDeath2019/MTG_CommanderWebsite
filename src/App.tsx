@@ -1,4 +1,6 @@
 import { lazy, Suspense, useMemo, useRef, useState } from 'react'
+import { loadSavedState as loadAndNormalizeSavedState, STORAGE_KEY, serializeSavedState } from './domain/persistence'
+import { exportCollectionCsv } from './domain/collection'
 import {
   CachedCardCatalog,
   scryfallCatalog,
@@ -11,7 +13,8 @@ import {
   resolveCollectionCardId,
 } from './domain/scryfall'
 import { deleteSavedDeck, getSavedDeckId, parseDeckList, upsertSavedDeck, type SavedDeck } from './domain/workspace'
-import { collectionFromMoxfieldRows, mergeMoxfieldInventory, type ResolvedMoxfieldRow } from './domain/moxfield'
+import type { ResolvedMoxfieldRow } from './domain/moxfield'
+import { applyMoxfieldImport as buildMoxfieldImportState } from './domain/import-workflow'
 import {
   buildDeck,
   describeRole,
@@ -21,8 +24,6 @@ import {
   getRoleLabel,
   importCollectionCsv,
   mergeCollection,
-  sampleCards,
-  sampleCollection,
   validateDeck,
   type Card,
   type Collection,
@@ -34,11 +35,11 @@ import './workspace.css'
 import './decks.css'
 import './moxfield.css'
 
-const STORAGE_KEY = 'spellbook-collection-v1'
 const cardCatalog = new CachedCardCatalog(scryfallCatalog)
-const MoxfieldImportDialog = lazy(() => import('./MoxfieldImportDialog'))
 
 type View = 'collection' | 'builder' | 'catalog'
+
+const MoxfieldImportDialog = lazy(() => import('./MoxfieldImportDialog'))
 
 interface SavedState {
   collection: Collection
@@ -52,27 +53,23 @@ interface SavedState {
 
 function loadSavedState(): SavedState {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw) {
-      const saved = JSON.parse(raw) as Partial<SavedState>
-      return {
-        collection: saved.collection ?? sampleCollection,
-        deck: saved.deck ?? null,
-        selectedCommander: saved.selectedCommander ?? 'alela',
-        cards: mergeCards(sampleCards, saved.cards ?? []),
-        savedDecks: saved.savedDecks ?? [],
-        activeSavedDeckId: saved.activeSavedDeckId ?? '',
-        moxfieldInventory: saved.moxfieldInventory ?? [],
-      }
-    }
+    return loadAndNormalizeSavedState(localStorage.getItem(STORAGE_KEY))
   } catch {
-    // Keep the app usable if browser storage is unavailable or malformed.
+    return loadAndNormalizeSavedState(null)
   }
-  return { collection: sampleCollection, deck: null, selectedCommander: 'alela', cards: sampleCards, savedDecks: [], activeSavedDeckId: '', moxfieldInventory: [] }
 }
 
 function App() {
   const [initial] = useState(loadSavedState)
+  const [persistenceReady] = useState(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, serializeSavedState(initial))
+      return true
+    } catch {
+      return false
+    }
+  })
+
   const [collection, setCollection] = useState(initial.collection)
   const [cards, setCards] = useState(initial.cards)
   const [deck, setDeck] = useState<Deck | null>(initial.deck)
@@ -95,8 +92,9 @@ function App() {
   const [addQuantity, setAddQuantity] = useState(1)
   const [newCommanders, setNewCommanders] = useState<string[]>([])
   const [showImport, setShowImport] = useState(false)
-  const [notice, setNotice] = useState('')
+  const [notice, setNotice] = useState(() => persistenceReady ? '' : 'Browser storage is unavailable. Collection changes will not persist after you leave this page.')
   const searchSequence = useRef(0)
+  const searchController = useRef<AbortController | null>(null)
 
   const cardById = (id: string) => cards.find((card) => card.id === id)
   const commanders = findOwnedCommanders(cards, collection)
@@ -114,8 +112,9 @@ function App() {
   }] : []
 
   function persist(nextCollection: Collection, nextDeck = deck, nextCommander = selectedCommander, nextCards = cards, nextSavedDecks = savedDecks, nextActiveDeckId = activeSavedDeckId, nextMoxfieldInventory = moxfieldInventory) {
+    if (!persistenceReady) return false
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      localStorage.setItem(STORAGE_KEY, serializeSavedState({
         collection: nextCollection,
         deck: nextDeck,
         selectedCommander: nextCommander,
@@ -124,24 +123,28 @@ function App() {
         activeSavedDeckId: nextActiveDeckId,
         moxfieldInventory: nextMoxfieldInventory,
       }))
+      return true
     } catch {
-      setNotice('Browser storage is full or unavailable. Export a collection backup to keep your changes.')
+      setNotice('Browser storage is full or unavailable. Your changes could not be saved in this browser; export a backup before leaving.')
+      return false
     }
   }
 
   function updateCollection(next: Collection, message: string) {
-    setCollection(next)
     let nextDeck = deck && (next[deck.commanderId] ?? 0) > 0 ? deck : null
     let nextSavedDecks = savedDecks
+    let nextActiveDeckId = activeSavedDeckId
     if (!nextDeck && deck) {
       nextSavedDecks = savedDecks.map((saved) => saved.id === activeSavedDeckId
         ? { ...saved, deck, updatedAt: new Date().toISOString() }
         : saved)
-      setSavedDecks(nextSavedDecks)
-      setActiveSavedDeckId('')
+      nextActiveDeckId = ''
     }
+    if (!persist(next, nextDeck, selectedCommander, cards, nextSavedDecks, nextActiveDeckId)) return
+    setCollection(next)
     setDeck(nextDeck)
-    persist(next, nextDeck, selectedCommander, cards, nextSavedDecks, nextDeck ? activeSavedDeckId : '')
+    setSavedDecks(nextSavedDecks)
+    setActiveSavedDeckId(nextActiveDeckId)
     setNotice(message)
   }
 
@@ -160,10 +163,14 @@ function App() {
   function generateDeck() {
     try {
       const nextDeck = buildDeck(cards, collection, selectedCommander)
+      const nextSavedDecks = activeSavedDeckId
+        ? savedDecks.map((saved) => saved.id === activeSavedDeckId ? { ...saved, deck: nextDeck, updatedAt: new Date().toISOString() } : saved)
+        : savedDecks
+      if (!persist(collection, nextDeck, selectedCommander, cards, nextSavedDecks, '')) return
       setDeck(nextDeck)
+      setSavedDecks(nextSavedDecks)
       setActiveSavedDeckId('')
       setDeckName('')
-      persist(collection, nextDeck, selectedCommander, cards, savedDecks, '')
       setNotice('Draft created from cards in your collection.')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not build this deck.')
@@ -175,9 +182,9 @@ function App() {
     try {
       const id = activeSavedDeckId || getSavedDeckId(deckName) || `deck-${Date.now()}`
       const updated = upsertSavedDeck(savedDecks, { id, name: deckName, deck, updatedAt: new Date().toISOString() })
+      if (!persist(collection, deck, deck.commanderId, cards, updated, id)) return
       setSavedDecks(updated)
       setActiveSavedDeckId(id)
-      persist(collection, deck, deck.commanderId, cards, updated, id)
       setDeckNameError('')
       setNotice('Deck saved to your local deck library.')
     } catch (error) {
@@ -186,11 +193,11 @@ function App() {
   }
 
   function openSavedDeck(saved: SavedDeck) {
+    if (!persist(collection, saved.deck, saved.deck.commanderId, cards, savedDecks, saved.id)) return
     setDeck(saved.deck)
     setSelectedCommander(saved.deck.commanderId)
     setActiveSavedDeckId(saved.id)
     setDeckName(saved.name)
-    persist(collection, saved.deck, saved.deck.commanderId, cards, savedDecks, saved.id)
     setView('builder')
     setNotice(`Opened ${saved.name}.`)
   }
@@ -198,9 +205,9 @@ function App() {
   function removeSavedDeck(deckId: string) {
     const updated = deleteSavedDeck(savedDecks, deckId)
     const nextActiveId = activeSavedDeckId === deckId ? '' : activeSavedDeckId
+    if (!persist(collection, deck, selectedCommander, cards, updated, nextActiveId)) return
     setSavedDecks(updated)
     setActiveSavedDeckId(nextActiveId)
-    persist(collection, deck, selectedCommander, cards, updated, nextActiveId)
     setNotice('Saved deck removed from this browser.')
   }
 
@@ -216,12 +223,13 @@ function App() {
     const name = `${cardById(commanderId)?.name ?? 'Imported'} deck`
     const id = getSavedDeckId(name) || `deck-${Date.now()}`
     const updated = upsertSavedDeck(savedDecks, { id, name, deck: importedDeck, updatedAt: new Date().toISOString() })
+    if (!persist(collection, importedDeck, commanderId, cards, updated, id)) return
     setSavedDecks(updated)
     setDeck(importedDeck)
     setSelectedCommander(commanderId)
     setDeckName(name)
     setActiveSavedDeckId(id)
-    persist(collection, importedDeck, commanderId, cards, updated, id)
+
     setShowDeckImport(false)
     setDeckImportText('')
     setView('builder')
@@ -232,16 +240,16 @@ function App() {
     const total = nextDeck.cards.reduce((sum, entry) => sum + entry.quantity, 0)
     nextDeck.missing = Math.max(0, 100 - total)
     nextDeck.complete = total === 100
-    setDeck(nextDeck)
     let nextSavedDecks = savedDecks
     if (activeSavedDeckId) {
       const active = savedDecks.find((saved) => saved.id === activeSavedDeckId)
       if (active) {
         nextSavedDecks = upsertSavedDeck(savedDecks, { ...active, deck: nextDeck, updatedAt: new Date().toISOString() })
-        setSavedDecks(nextSavedDecks)
       }
     }
-    persist(collection, nextDeck, selectedCommander, cards, nextSavedDecks, activeSavedDeckId)
+    if (!persist(collection, nextDeck, selectedCommander, cards, nextSavedDecks, activeSavedDeckId)) return
+    setDeck(nextDeck)
+    setSavedDecks(nextSavedDecks)
   }
 
   function removeDeckCard(cardId: string) {
@@ -273,23 +281,24 @@ function App() {
     setCatalogQuery(query)
     setCatalogError('')
     const requestId = ++searchSequence.current
+    searchController.current?.abort()
     if (query.trim().length < 2) {
       setCatalogResults([])
       setCatalogLoading(false)
       return
     }
+    const controller = new AbortController()
+    searchController.current = controller
     setCatalogLoading(true)
     try {
-      const results = await cardCatalog.search(query)
+      const results = await cardCatalog.search(query, controller.signal)
       if (requestId !== searchSequence.current) return
-      setCards((current) => {
-        const merged = mergeCards(current, results)
-        persist(collection, deck, selectedCommander, merged)
-        return merged
-      })
+      const mergedCards = mergeCards(cards, results)
+      if (!persist(collection, deck, selectedCommander, mergedCards)) return
+      setCards(mergedCards)
       setCatalogResults(results)
     } catch (error) {
-      if (requestId === searchSequence.current) {
+      if (requestId === searchSequence.current && !(error instanceof DOMException && error.name === 'AbortError')) {
         setCatalogError(error instanceof Error ? error.message : 'Card search failed. Please try again.')
         setCatalogResults([])
       }
@@ -302,11 +311,17 @@ function App() {
     const card = cardById(cardId)
     if (!card) return
     const inventoryId = resolveCollectionCardId(card, cards, collection)
-    const updatedCollection = addCardToCollection(collection, inventoryId, addQuantity)
+    let updatedCollection: Collection
+    try {
+      updatedCollection = addCardToCollection(collection, inventoryId, addQuantity)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not add this quantity.')
+      return
+    }
     const unlocked = newlyEnabledCommanders(collection, updatedCollection, cards).map((entry) => entry.name)
+    if (!persist(updatedCollection)) return
     setNewCommanders(unlocked)
     setCollection(updatedCollection)
-    persist(updatedCollection)
     setPendingCardId('')
     setAddQuantity(1)
     const deckNames = decksAffectedByCard(card, affectedDecks)
@@ -319,42 +334,56 @@ function App() {
     setShowImport(true)
   }
 
-  function applyMoxfieldImport(rows: ResolvedMoxfieldRow[], mode: 'replace' | 'add') {
-    const imported = collectionFromMoxfieldRows(rows)
-    const nextCollection = mode === 'replace' ? imported : mergeCollection(collection, imported)
-    const nextInventory = mode === 'replace' ? rows : mergeMoxfieldInventory(moxfieldInventory, rows)
-    const unlocked = newlyEnabledCommanders(collection, nextCollection, cards).map((card) => card.name)
-    setCollection(nextCollection)
-    setMoxfieldInventory(nextInventory)
-    setNewCommanders(unlocked)
-    persist(nextCollection, deck, selectedCommander, cards, savedDecks, activeSavedDeckId, nextInventory)
-    setShowImport(false)
-    setNotice(`${mode === 'replace' ? 'Replaced collection with' : 'Added'} ${Object.values(imported).reduce((sum, count) => sum + count, 0).toLocaleString()} cards from Moxfield.`)
+  function applyMoxfieldImport(rows: ResolvedMoxfieldRow[], mode: 'replace' | 'add', resolvedCards: Card[]) {
+    try {
+      const next = buildMoxfieldImportState({ cards, collection, inventory: moxfieldInventory }, rows, resolvedCards, mode)
+      const unlocked = newlyEnabledCommanders(collection, next.collection, next.cards).map((card) => card.name)
+      if (!persist(next.collection, deck, selectedCommander, next.cards, savedDecks, activeSavedDeckId, next.inventory)) return
+      setCards(next.cards)
+      setCollection(next.collection)
+      setMoxfieldInventory(next.inventory)
+      setNewCommanders(unlocked)
+      setShowImport(false)
+      const importedCount = Object.values(rows.reduce<Record<string, number>>((totals, row) => {
+        totals[row.cardId] = (totals[row.cardId] ?? 0) + row.count
+        return totals
+      }, {})).reduce((sum, count) => sum + count, 0)
+      setNotice(`${mode === 'replace' ? 'Replaced collection with' : 'Added'} ${importedCount.toLocaleString()} cards from Moxfield.`)
+    } catch (error) {
+      setNotice(error instanceof Error ? `Import rejected: ${error.message}` : 'Import rejected: invalid card quantities.')
+    }
   }
 
   function importLegacyCsv(file: File) {
     void file.text().then((text) => {
       const parsed = importCollectionCsv(text, cards)
-      if (parsed.errors.length) {
-        setNotice(`Could not import ${file.name}: ${parsed.errors.slice(0, 3).join(' ')}`)
-        return
-      }
       if (!Object.keys(parsed.collection).length) {
-        setNotice(`No recognizable card rows found in ${file.name}.`)
+        setNotice(parsed.errors.length
+          ? `Could not import ${file.name}: ${parsed.errors.slice(0, 3).join(' ')}`
+          : `No recognizable cards found in ${file.name}.`)
         return
       }
-      const updated = mergeCollection(collection, parsed.collection)
+      let updated: Collection
+      try {
+        updated = mergeCollection(collection, parsed.collection)
+      } catch (error) {
+        setNotice(error instanceof Error ? `Import rejected: ${error.message}` : 'Import rejected.')
+        return
+      }
+      if (!persist(updated)) return
       setCollection(updated)
-      persist(updated)
-      setNotice(`Added ${Object.values(parsed.collection).reduce((sum, count) => sum + count, 0).toLocaleString()} cards from ${file.name}.`)
-      setShowImport(false)
+      const importedCount = Object.values(parsed.collection).reduce((sum, count) => sum + count, 0)
+      setNotice(`Added ${importedCount.toLocaleString()} recognized cards from ${file.name}.${parsed.errors.length ? ` ${parsed.errors.length} rows need review.` : ''}`)
+      if (!parsed.errors.length) setShowImport(false)
     }).catch(() => setNotice(`Could not read ${file.name}.`))
   }
 
   function chooseCommander(cardId: string) {
+    if (!persist(collection, null, cardId)) {
+      return
+    }
     setSelectedCommander(cardId)
     setDeck(null)
-    persist(collection, null, cardId)
   }
 
   function downloadFile(name: string, content: string, type: string) {
@@ -367,11 +396,11 @@ function App() {
   }
 
   function exportCollection() {
-    const rows = ['name,quantity', ...Object.entries(collection).map(([id, quantity]) => {
-      const name = cardById(id)?.name ?? id
-      return `"${name.replaceAll('"', '""')}",${quantity}`
-    })]
-    downloadFile('spellbook-collection.csv', rows.join('\n'), 'text/csv')
+    try {
+      downloadFile('spellbook-collection.csv', exportCollectionCsv(collection, cards), 'text/csv')
+    } catch (error) {
+      setNotice(error instanceof Error ? `Could not export collection: ${error.message}` : 'Could not export collection.')
+    }
   }
 
   function exportDeck() {
@@ -417,7 +446,7 @@ function App() {
             <div className="feature-card-bottom"><strong>Alela, Artful Provocateur</strong><span>W U B</span></div>
           </div>
           <div className="floating-label label-top"><span>✧</span> Your collection, connected</div>
-          <div className="floating-label label-bottom"><span className="pulse" /> {buildableCount} compatible owned cards in sample data</div>
+          <div className="floating-label label-bottom"><span className="pulse" /> {buildableCount} compatible owned cards {cards.some((card) => card.source === 'sample') ? 'in sample data' : 'in your collection'}</div>
           <div className="mini-star star-one">✧</div><div className="mini-star star-two">✦</div>
         </div>
       </section>
@@ -426,7 +455,8 @@ function App() {
         <div className="stat"><span className="stat-icon violet">▤</span><div><strong>{totalOwned.toLocaleString()}</strong><span>Cards in collection</span></div></div>
         <div className="stat"><span className="stat-icon green">♧</span><div><strong>{commanders.length}</strong><span>Owned commanders</span></div></div>
         <div className="stat"><span className="stat-icon gold">✧</span><div><strong>{Object.keys(collection).length}</strong><span>Unique cards</span></div></div>
-        <div className="stat stat-note"><span>✦</span><span>One living collection<br />for all your decks.</span></div>
+        <div className="stat stat-note"><span>✦</span><span>{cards.some((card) => card.source === 'sample') ? 'Sample data shown' : 'One living collection'}<br />{cards.some((card) => card.source === 'sample') ? 'Verified from the card list.' : 'for all your decks.'}</span></div>
+        {!persistenceReady && <div className="storage-warning" role="alert">Browser storage is unavailable. Your collection changes won’t persist after leaving this page.</div>}
       </section>
 
       <section className="workspace" id="workspace">

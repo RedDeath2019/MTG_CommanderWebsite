@@ -1,3 +1,5 @@
+import { parseNamedCollectionCsv } from './collection'
+
 export type Color = 'W' | 'U' | 'B' | 'R' | 'G'
 export type CardRole = 'commander' | 'land' | 'ramp' | 'draw' | 'removal' | 'wipe' | 'protection' | 'synergy' | 'flex'
 
@@ -17,12 +19,16 @@ export interface Card {
   source?: 'scryfall' | 'sample'
 }
 
+
 export type Collection = Record<string, number>
 
 export function mergeCollection(current: Collection, incoming: Collection): Collection {
   const merged = { ...current }
   for (const [cardId, quantity] of Object.entries(incoming)) {
-    merged[cardId] = (merged[cardId] ?? 0) + quantity
+    if (!Number.isInteger(quantity) || quantity < 1) throw new Error(`Invalid quantity for ${cardId}.`)
+    const total = (merged[cardId] ?? 0) + quantity
+    if (!Number.isSafeInteger(total)) throw new Error(`Quantity for ${cardId} exceeds the safe integer limit.`)
+    merged[cardId] = total
   }
   return merged
 }
@@ -88,41 +94,54 @@ export function validateDeck(deck: Deck, cards: Card[], collection: Collection):
   const issues: DeckIssue[] = []
   const cardById = new Map(cards.map((card) => [card.id, card]))
   const commander = cardById.get(deck.commanderId)
-  const commanderEntry = deck.cards.find((entry) => entry.cardId === deck.commanderId)
-  if (!commander || !commander.commanderLegal || commanderEntry?.quantity !== 1) {
+  const commanderEntries = deck.cards.filter((entry) => entry.cardId === deck.commanderId)
+  if (!commander || !commander.commanderLegal || commanderEntries.length !== 1 || commanderEntries[0].quantity !== 1) {
     issues.push({ code: 'commander', cardId: deck.commanderId, message: 'Deck must contain one legal commander.' })
   }
   const allowedColors = new Set(commander?.colorIdentity ?? [])
   let total = 0
-  const seen = new Set<string>()
-
-  for (const entry of deck.cards) {
-    total += entry.quantity
-    const card = cardById.get(entry.cardId)
-    if (!card) {
-      issues.push({ code: 'missing-card', cardId: entry.cardId, message: 'Card is not in the card catalog.' })
-      continue
-    }
-    if (!Number.isInteger(entry.quantity) || entry.quantity < 1) {
-      issues.push({ code: 'quantity', cardId: entry.cardId, message: 'Card quantity must be a positive whole number.' })
-      continue
-    }
-    if (!card.commanderLegal) issues.push({ code: 'illegal', cardId: card.id, message: `${card.name} is not legal in Commander.` })
-    const basicLandException = new Set(['Plains', 'Island', 'Swamp', 'Mountain', 'Forest', 'Wastes'])
-    if (!basicLandException.has(card.name) && card.colorIdentity.some((color) => !allowedColors.has(color))) {
-      issues.push({ code: 'color-identity', cardId: card.id, message: `${card.name} is outside the commander's color identity.` })
-    }
-    if ((collection[card.id] ?? 0) < entry.quantity) {
-      issues.push({ code: 'unowned', cardId: card.id, message: `Not enough owned copies of ${card.name}.` })
-    }
-    const isBasicLand = /Basic Land/i.test(card.typeLine)
-    if (!isBasicLand && (seen.has(card.id) || entry.quantity > 1)) {
-      issues.push({ code: 'singleton', cardId: card.id, message: `${card.name} exceeds the Commander singleton limit.` })
-    }
-    seen.add(card.id)
+  const quantityByCard = new Map<string, number>()
+  const issueKeys = new Set<string>()
+  const addIssue = (issue: DeckIssue) => {
+    const key = `${issue.code}:${issue.cardId ?? ''}`
+    if (issueKeys.has(key)) return
+    issueKeys.add(key)
+    issues.push(issue)
   }
 
-  if (total > 100) issues.push({ code: 'deck-size', message: 'A Commander deck cannot exceed 100 cards.' })
+  for (const entry of deck.cards) {
+    if (!Number.isSafeInteger(entry.quantity) || entry.quantity < 1) {
+      addIssue({ code: 'quantity', cardId: entry.cardId, message: 'Card quantity must be a positive whole number.' })
+      continue
+    }
+    total += entry.quantity
+    if (!Number.isSafeInteger(total)) {
+      addIssue({ code: 'deck-size', message: 'Deck card total exceeds a safe integer.' })
+      total = Number.MAX_SAFE_INTEGER
+    }
+    quantityByCard.set(entry.cardId, (quantityByCard.get(entry.cardId) ?? 0) + entry.quantity)
+    const card = cardById.get(entry.cardId)
+    if (!card) {
+      addIssue({ code: 'missing-card', cardId: entry.cardId, message: 'Card is not in the card catalog.' })
+      continue
+    }
+    if (!card.commanderLegal) addIssue({ code: 'illegal', cardId: card.id, message: `${card.name} is not legal in Commander.` })
+    const basicLandException = new Set(['Plains', 'Island', 'Swamp', 'Mountain', 'Forest', 'Wastes'])
+    if (!basicLandException.has(card.name) && card.colorIdentity.some((color) => !allowedColors.has(color))) {
+      addIssue({ code: 'color-identity', cardId: card.id, message: `${card.name} is outside the commander's color identity.` })
+    }
+    const isBasicLand = /Basic Land/i.test(card.typeLine)
+    const quantity = quantityByCard.get(card.id) ?? 0
+    if (!isBasicLand && quantity > 1) addIssue({ code: 'singleton', cardId: card.id, message: `${card.name} exceeds the Commander singleton limit.` })
+  }
+
+  for (const [cardId, quantity] of quantityByCard) {
+    const card = cardById.get(cardId)
+    if (card && (collection[cardId] ?? 0) < quantity) {
+      addIssue({ code: 'unowned', cardId, message: `Not enough owned copies of ${card.name}.` })
+    }
+  }
+  if (total > 100) addIssue({ code: 'deck-size', message: 'A Commander deck cannot exceed 100 cards.' })
   return issues
 }
 
@@ -137,51 +156,9 @@ export function findOwnedCommanders(cards: Card[], collection: Collection): Card
   return cards.filter((card) => card.commanderLegal && card.roles.includes('commander') && (collection[card.id] ?? 0) > 0)
 }
 
-function parseCsvRow(line: string): string[] {
-  const fields: string[] = []
-  let field = ''
-  let quoted = false
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index]
-    if (character === '"' && quoted && line[index + 1] === '"') {
-      field += '"'
-      index += 1
-    } else if (character === '"') {
-      quoted = !quoted
-    } else if (character === ',' && !quoted) {
-      fields.push(field.trim())
-      field = ''
-    } else {
-      field += character
-    }
-  }
-  fields.push(field.trim())
-  return fields
-}
 
 export function importCollectionCsv(csv: string, cards: Card[]): { collection: Collection; errors: string[] } {
-  const lines = csv.trim().split(/\r?\n/)
-  const collection: Collection = {}
-  const errors: string[] = []
-  if (lines.length < 2) return { collection, errors: ['Add a header and at least one collection row.'] }
-  const headers = parseCsvRow(lines[0]).map((header) => header.toLowerCase())
-  const nameColumn = headers.findIndex((header) => ['name', 'card', 'card name'].includes(header))
-  const quantityColumn = headers.findIndex((header) => ['quantity', 'count', 'qty'].includes(header))
-  if (nameColumn < 0 || quantityColumn < 0) {
-    return { collection, errors: ['CSV needs a name/card column and a quantity/count column.'] }
-  }
-  const byName = new Map(cards.map((card) => [card.name.toLowerCase(), card.id]))
-  lines.slice(1).forEach((line, index) => {
-    if (!line.trim()) return
-    const columns = parseCsvRow(line)
-    const name = columns[nameColumn] ?? ''
-    const quantity = Number(columns[quantityColumn])
-    const id = byName.get(name.toLowerCase())
-    if (!id) errors.push(`Row ${index + 2}: unknown card "${name}".`)
-    else if (!Number.isInteger(quantity) || quantity < 1) errors.push(`Row ${index + 2}: quantity must be a positive whole number.`)
-    else collection[id] = (collection[id] ?? 0) + quantity
-  })
-  return { collection, errors }
+  return parseNamedCollectionCsv(csv, cards)
 }
 
 export const sampleCards: Card[] = [

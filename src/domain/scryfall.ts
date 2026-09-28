@@ -96,8 +96,10 @@ export function resolveCollectionCardId(card: Card, knownCards: Card[], collecti
 }
 
 export function addCardToCollection(collection: Record<string, number>, cardId: string, quantity = 1): Record<string, number> {
-  if (!Number.isInteger(quantity) || quantity < 1) throw new Error('Quantity must be a positive whole number.')
-  return { ...collection, [cardId]: (collection[cardId] ?? 0) + quantity }
+  if (!Number.isSafeInteger(quantity) || quantity < 1) throw new Error('Quantity must be a positive whole number.')
+  const total = (collection[cardId] ?? 0) + quantity
+  if (!Number.isSafeInteger(total)) throw new Error('Collection quantity exceeds the safe integer limit.')
+  return { ...collection, [cardId]: total }
 }
 
 export function decksAffectedByCard(card: Card, decks: Array<{ name: string; cardIds: string[]; colorIdentity: Color[] }>): string[] {

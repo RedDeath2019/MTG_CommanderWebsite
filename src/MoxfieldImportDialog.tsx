@@ -1,10 +1,11 @@
 import { useRef, useState } from 'react'
+import type { Card } from './domain/deck'
 import { collectionFromMoxfieldRows, looksLikeMoxfieldCsv, lookupMoxfieldPrintings, parseMoxfieldCsv, resolveMoxfieldRows, type ResolvedMoxfieldRow } from './domain/moxfield'
 import './moxfield.css'
 
 interface Props {
   onClose: () => void
-  onImport: (rows: ResolvedMoxfieldRow[], mode: 'replace' | 'add') => void
+  onImport: (rows: ResolvedMoxfieldRow[], mode: 'replace' | 'add', cards: Card[]) => void
   onLegacyImport?: (file: File) => void
 }
 
@@ -15,6 +16,7 @@ function formatLookupProgress(current: number, total: number): string {
 export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [rows, setRows] = useState<ResolvedMoxfieldRow[]>([])
+  const [resolvedCards, setResolvedCards] = useState<Card[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [mode, setMode] = useState<'replace' | 'add'>('replace')
@@ -24,6 +26,7 @@ export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport
     if (!file) return
     setErrors([])
     setRows([])
+    setResolvedCards([])
     setProgress('')
     const text = await file.text()
     const parsed = parseMoxfieldCsv(text)
@@ -44,6 +47,7 @@ export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport
       const lookup = await lookupMoxfieldPrintings(parsed.rows, undefined, (current, total) => setProgress(formatLookupProgress(current, total)), 500)
       const resolved = resolveMoxfieldRows(parsed.rows, lookup.cards)
       setRows(resolved.rows)
+      setResolvedCards(resolved.cards)
       setErrors([...parsed.errors, ...lookup.errors, ...resolved.errors])
     } catch (error) {
       setErrors([...parsed.errors, error instanceof Error ? error.message : 'Could not resolve card printings.'])
@@ -66,7 +70,7 @@ export default function MoxfieldImportDialog({ onClose, onImport, onLegacyImport
         <div className="moxfield-review-heading"><strong>Review import</strong><span>{rows.length.toLocaleString()} groups matched · {total.toLocaleString()} cards</span></div>
         <div className="moxfield-mode"><label><input type="radio" name="import-mode" checked={mode === 'replace'} onChange={() => setMode('replace')} /> Replace current collection</label><label><input type="radio" name="import-mode" checked={mode === 'add'} onChange={() => setMode('add')} /> Add to current collection</label></div>
         <div className="moxfield-preview">{rows.slice(0, 10).map((row, index) => <div key={`${row.cardId}-${row.edition}-${row.collectorNumber}-${row.foil}-${index}`}><span>{row.name}</span><small>{row.edition.toUpperCase()} #{row.collectorNumber} · {row.foil ? 'Foil' : 'Nonfoil'} · {row.condition} · {row.language}</small><b>×{row.count}</b></div>)}{rows.length > 10 && <p>And {(rows.length - 10).toLocaleString()} more groups…</p>}</div>
-        <div className="moxfield-review-actions"><button className="button button-outline" onClick={() => setRows([])}>Cancel review</button><button className="button button-primary" onClick={() => onImport(rows, mode)}>Confirm {mode === 'replace' ? 'replacement' : 'addition'}</button></div>
+        <div className="moxfield-review-actions"><button className="button button-outline" onClick={() => setRows([])}>Cancel review</button><button className="button button-primary" onClick={() => onImport(rows, mode, resolvedCards)}>Confirm {mode === 'replace' ? 'replacement' : 'addition'}</button></div>
       </section>}
       {errors.length > 0 && <ul className="import-errors">{errors.map((error, index) => <li key={index}>{error}</li>)}</ul>}
       {!rows.length && <div className="csv-example"><span>CSV format</span><br />Moxfield export or name,quantity</div>}

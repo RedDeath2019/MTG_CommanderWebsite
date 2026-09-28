@@ -48,7 +48,7 @@ describe('validateDeck', () => {
       ],
     }
     const issues = validateDeck(deck, cards, { commander: 1, 'off-color': 1, banned: 1, draw: 1 })
-    expect(issues.map((issue) => issue.code)).toEqual(['color-identity', 'illegal', 'unowned', 'singleton'])
+    expect(issues.map((issue) => issue.code)).toEqual(['color-identity', 'illegal', 'singleton', 'unowned'])
   })
 })
 

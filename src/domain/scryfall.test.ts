@@ -94,4 +94,9 @@ describe('Scryfall card normalization', () => {
     const updated = { ...existing, alela: 1 }
     expect(newlyEnabledCommanders(existing, updated, sampleCards).map((card) => card.id)).toEqual(['alela'])
   })
+
+  it('rejects collection quantity overflow instead of corrupting inventory', () => {
+    expect(() => addCardToCollection({ card: Number.MAX_SAFE_INTEGER }, 'card')).toThrow(/safe integer/)
+    expect(() => addCardToCollection({}, 'card', Number.MAX_SAFE_INTEGER + 1)).toThrow(/positive whole number/)
+  })
 })

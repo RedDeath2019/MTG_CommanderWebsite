@@ -33,7 +33,12 @@ Headers accepted for name: `name`, `card`, `card name`; quantity: `quantity`, `c
 npm test       # domain behavior tests
 npm run lint   # lint
 npm run build  # TypeScript check and production build
+npm run test:e2e # browser tests (Playwright starts its own Vite server)
 ```
+
+To point browser tests at an already-running development server, set `PLAYWRIGHT_BASE_URL=http://127.0.0.1:<port>` before `npm run test:e2e`.
+
+Moxfield collection imports resolve set/collector-number pairs through Scryfall, preserve printing-level inventory details, and only commit after explicit review. Resolved cards are merged into the local card catalog together with collection quantities. Storage remains local to this browser; export backups before clearing browser data.
 
 ## Deck lists and saved decks
 
